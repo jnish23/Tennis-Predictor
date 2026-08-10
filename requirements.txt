@@ -1,0 +1,14 @@
+pandas>=2.2
+numpy>=1.26
+lightgbm>=4.3
+scikit-learn>=1.4
+scipy>=1.12
+streamlit>=1.35
+plotly>=5.20
+openpyxl>=3.1
+xlrd>=2.0
+requests>=2.31
+pyarrow>=15.0
+pytest>=8.0
+matplotlib>=3.8
+optuna>=4.0   # optional: Bayesian search in notebooks/model_analysis.py

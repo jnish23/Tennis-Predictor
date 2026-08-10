@@ -1,0 +1,35 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tennis.odds</string>
+
+  <!-- Live odds capture only. Two HTTP requests, a few seconds. Separate from
+       com.tennis.daily because that job is heavy and wants to run once, after
+       play, while this one is cheap and its whole value is in frequency. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jordannishimura/Tennis Predictor/scripts/capture_odds.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jordannishimura/Tennis Predictor</string>
+
+  <!-- Every 3 hours. Tour play spans roughly 08:00-02:00 UTC, so this lands a
+       capture within ~1.5h of a typical start; the 4x/day source we backfilled
+       from averaged 10.7h between its first and last look at a fixture. Eight
+       scrapes a day of two pages is negligible load on the site.
+       StartInterval rather than eight calendar entries: it also fires on wake,
+       so a sleeping laptop resumes instead of silently skipping the slot. -->
+  <key>StartInterval</key>
+  <integer>10800</integer>
+
+  <key>RunAtLoad</key>
+  <true/>
+  <key>StandardOutPath</key>
+  <string>/Users/jordannishimura/Tennis Predictor/data/launchd-odds.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jordannishimura/Tennis Predictor/data/launchd-odds.log</string>
+</dict>
+</plist>

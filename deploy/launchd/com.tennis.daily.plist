@@ -1,0 +1,34 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.tennis.daily</string>
+
+  <!-- Ingest only: pulls the TennisMyLife ongoing files + current-season odds,
+       reloads matches, extends features incrementally. ~30s. -->
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/jordannishimura/Tennis Predictor/scripts/daily.sh</string>
+  </array>
+
+  <key>WorkingDirectory</key>
+  <string>/Users/jordannishimura/Tennis Predictor</string>
+
+  <!-- 21:40 local. TennisMyLife refreshes through the day, so a evening run
+       picks up everything from the previous night's play. -->
+  <key>StartCalendarInterval</key>
+  <dict>
+    <key>Hour</key><integer>21</integer>
+    <key>Minute</key><integer>50</integer>
+  </dict>
+
+  <!-- Laptops sleep. Without this a missed 21:40 is simply skipped. -->
+  <key>RunAtLoad</key>
+  <false/>
+  <key>StandardOutPath</key>
+  <string>/Users/jordannishimura/Tennis Predictor/data/launchd-daily.log</string>
+  <key>StandardErrorPath</key>
+  <string>/Users/jordannishimura/Tennis Predictor/data/launchd-daily.log</string>
+</dict>
+</plist>

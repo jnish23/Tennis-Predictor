@@ -1,0 +1,11 @@
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.DS_Store
+
+# Cached source files and derived artifacts are rebuildable from the pipeline
+# and are far too large for version control (data ~200 MB, artifacts ~150 MB).
+data/
+artifacts/
+.env

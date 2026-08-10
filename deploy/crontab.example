@@ -1,0 +1,12 @@
+# ATP tennis predictor — daily ingest 06:15 UTC, weekly retrain Mondays 07:00 UTC
+#
+# scripts/daily.sh does not redirect its own output (launchd routes it via
+# StandardOutPath, and a redirect there would collapse the two agents into one
+# log). cron has no such mechanism, so each entry redirects for itself —
+# otherwise cron mails the output or drops it.
+# Live odds capture every 3 hours. Cheap, and only the price nearest a match's
+# start is a closing line -- the last capture before play scores 0.00410 better
+# than the first, so frequency is where this one earns its keep.
+0 */3 * * * /opt/tennis-predictor/scripts/capture_odds.sh >> /opt/tennis-predictor/data/cron-odds.log 2>&1
+15 6 * * *  /opt/tennis-predictor/scripts/daily.sh >> /opt/tennis-predictor/data/cron-daily.log 2>&1
+0  7 * * 1  /opt/tennis-predictor/scripts/daily.sh --retrain --full-history >> /opt/tennis-predictor/data/cron-weekly.log 2>&1

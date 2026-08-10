@@ -1,0 +1,18 @@
+[Unit]
+Description=ATP Tennis Prediction Dashboard (Streamlit)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=tennis
+WorkingDirectory=/opt/tennis-predictor
+Environment=PORT=8502
+ExecStart=/opt/tennis-predictor/scripts/run_dashboard.sh
+Restart=on-failure
+RestartSec=10
+StandardOutput=append:/opt/tennis-predictor/data/dashboard.log
+StandardError=append:/opt/tennis-predictor/data/dashboard.log
+
+[Install]
+WantedBy=multi-user.target
