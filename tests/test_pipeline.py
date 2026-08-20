@@ -150,6 +150,7 @@ def test_simulation_is_not_deterministic_chaining():
     not (__import__("tennis.config", fromlist=["ARTIFACTS"]).ARTIFACTS / "models.pkl").exists(),
     reason="production models not trained",
 )
+@pytest.mark.needs_db
 def test_predictions_are_orientation_symmetric():
     from tennis.db.schema import connect
     from tennis.models.predict import MatchContext, Predictor
@@ -173,6 +174,7 @@ def test_predictions_are_orientation_symmetric():
 # --------------------------------------------------------------------------
 # incremental update path
 # --------------------------------------------------------------------------
+@pytest.mark.needs_db
 def test_incremental_matches_full_recompute(tmp_path):
     """Resuming from pickled state must equal a from-scratch rebuild.
 
@@ -212,6 +214,7 @@ def test_incremental_matches_full_recompute(tmp_path):
 # --------------------------------------------------------------------------
 # draw reconstruction
 # --------------------------------------------------------------------------
+@pytest.mark.needs_db
 def test_bracket_reconstruction_matches_known_result():
     """Roland Garros 2024: bracket, finalists and champion must come out right."""
     from tennis.db.schema import connect
@@ -245,6 +248,7 @@ def test_bracket_reconstruction_matches_known_result():
     assert (ap["SF"] == 1).sum() == 4 and (ap["QF"] == 1).sum() == 8
 
 
+@pytest.mark.needs_db
 def test_reconstruction_rate_is_high():
     """The recovery rate across recent seasons must not regress."""
     from tennis.db.schema import connect
@@ -266,6 +270,7 @@ def test_reconstruction_rate_is_high():
     assert ok / total > 0.95, f"reconstruction rate fell to {ok/total:.1%}"
 
 
+@pytest.mark.needs_db
 def test_actual_progression_credits_byes():
     """A player who receives a first-round bye still counts as advancing."""
     from tennis.db.schema import connect
@@ -289,6 +294,7 @@ def test_actual_progression_credits_byes():
     assert (ap["Final"] == 1).sum() == 2
 
 
+@pytest.mark.needs_db
 def test_feed_name_resolution_handles_both_formats():
     """'Jannik Sinner' and 'Sinner J.' must resolve to the same player.
 
@@ -358,6 +364,7 @@ def test_draw_sheet_keeps_bye_players():
     assert list(sheet["draw_pos"]) == [1, 2, 3, 4]
 
 
+@pytest.mark.needs_db
 def test_draw_sheet_bracket_has_bye_slots():
     """Bye players occupy a real slot paired with BYE, preserving draw order."""
     from tennis.ingest.draws_api import build_draw_from_sheet, parse_draw_sheet
@@ -410,6 +417,7 @@ def test_resolved_matches_are_not_simulated():
     assert pinned["Champion"].sum() == pytest.approx(1.0, abs=1e-9)
 
 
+@pytest.mark.needs_db
 def test_walk_bracket_pins_completed_rounds_only():
     """Rounds are pinned up to the first incomplete one, and no further."""
     from tennis.db.schema import connect
@@ -445,6 +453,7 @@ def test_walk_bracket_pins_completed_rounds_only():
     assert done_p == 0
 
 
+@pytest.mark.needs_db
 def test_replay_from_round_state_precedes_that_round():
     """Feature state for round N must stop before round N's first match."""
     from tennis.db.schema import connect
@@ -469,6 +478,7 @@ def test_replay_from_round_state_precedes_that_round():
     assert earlier["seq"].max() < rep["state_seq"]
 
 
+@pytest.mark.needs_db
 def test_tourney_xref_prefers_the_right_event_not_the_biggest():
     """Linking must not be won by whichever tournament has more matches.
 
@@ -514,6 +524,7 @@ def test_tourney_xref_prefers_the_right_event_not_the_biggest():
         con.close()
 
 
+@pytest.mark.needs_db
 def test_winner_convention_counts_cannot_go_negative():
     """A pair that met twice must count once, as unknown."""
     from tennis.ingest.draws_api import verify_winner_convention
@@ -718,6 +729,7 @@ def test_replacement_takes_the_withdrawn_players_slot():
     assert everyone.count("Lucky Loser") == 1
 
 
+@pytest.mark.needs_db
 def test_reconciled_draw_is_a_clean_power_of_two():
     from tennis.ingest.draws_api import build_draw_from_sheet, parse_draw_sheet
 
@@ -1204,3 +1216,89 @@ def test_te_parses_opening_and_closing_prices():
     # A cell with no hover table has a close and no history -- not a zero.
     flat = next(r for r in q if r["line_unit"] == "games" and r["side"] == "p2")
     assert flat["price_close"] == 1.75 and flat["price_open"] is None
+
+
+# --------------------------------------------------------------------------
+# devigging
+# --------------------------------------------------------------------------
+def test_devig_methods_return_valid_probabilities():
+    import numpy as np
+
+    from tennis.models.devig import power, proportional, shin
+
+    prices = np.array([[1.20, 5.00], [1.90, 1.95], [1.05, 12.0], [2.50, 1.55]])
+    for name, p in (("proportional", proportional(prices)),
+                    ("shin", shin(prices)[0]), ("power", power(prices)[0])):
+        assert np.allclose(p.sum(axis=1), 1.0), name
+        assert (p > 0).all() and (p < 1).all(), name
+
+
+def test_devig_is_a_no_op_on_a_zero_margin_book():
+    """With no margin there is nothing to remove, whatever the method."""
+    import numpy as np
+
+    from tennis.models.devig import power, proportional, shin
+
+    fair = np.array([[2.0, 2.0], [4.0, 4.0 / 3.0]])
+    for p in (proportional(fair), shin(fair)[0], power(fair)[0]):
+        assert np.allclose(p[:, 0], [0.5, 0.25], atol=1e-6)
+
+
+def test_shin_moves_probability_toward_the_favourite():
+    """The whole point: books load the margin onto the longshot.
+
+    Proportional devigging assumes an even split and therefore leaves the
+    favourite-longshot bias in place -- measured on our own data as backing
+    every favourite returning -5.4% against a 6.7% vig while backing every
+    underdog returned -11.5%. Shin shifts probability from the longshot to the
+    favourite, which is the correction. Scored on 523,879 quotes it beat
+    proportional in 16 of 17 books, the exception being an exchange with no
+    bookmaker margin to misallocate.
+    """
+    import numpy as np
+
+    from tennis.models.devig import proportional, shin
+
+    prices = np.array([[1.20, 5.00], [1.05, 12.0], [2.50, 1.55]])
+    pr, sh = proportional(prices)[:, 0], shin(prices)[0][:, 0]
+    fav = pr > 0.5
+    assert (sh[fav] > pr[fav]).all()       # favourites get more
+    assert (sh[~fav] < pr[~fav]).all()     # longshots get less
+    # and the insider fraction it implies should be small but non-zero
+    z = shin(prices)[1]
+    assert ((z > 0) & (z < 0.25)).all()
+
+
+def test_dedupe_fixtures_keys_on_the_pairing_not_the_date():
+    """One row per pairing, however many times the site re-lists the match.
+
+    A postponed fixture reappears under a new play_date, and the earlier key of
+    (play_date, p1, p2) let it through once per listing -- three rows for one
+    match on the betting page, which is a tripled stake on a single result.
+    The site's p1/p2 order is not stable between captures either, so a swapped
+    re-listing has to collapse onto the same key.
+    """
+    import pandas as pd
+
+    # app.py runs Streamlit calls at import, so pull the function out by source
+    src = open("dashboard/app.py").read()
+    start = src.index("def dedupe_fixtures")
+    end = src.index("@st.cache_data", start)
+    ns: dict = {"pd": pd}
+    exec(src[start:end], ns)
+    dedupe = ns["dedupe_fixtures"]
+
+    df = pd.DataFrame({
+        "p1_name": ["Blanchet U.", "Blanchet U.", "Sakamoto R.", "Kozlov S."],
+        "p2_name": ["Sakamoto R.", "Sakamoto R.", "Blanchet U.", "Mayo A."],
+        "play_date": [20260810, 20260812, 20260813, 20260812],
+        "captured_at": ["2026-08-10T04:00", "2026-08-12T04:00",
+                        "2026-08-13T04:00", "2026-08-12T04:00"],
+        "p1_odds": [3.84, 3.84, 1.28, 2.44],
+    })
+    out = dedupe(df)
+    assert len(out) == 2, "three listings of one match must collapse to one row"
+    # The freshest capture survives, including the one with the names swapped.
+    kept = out.set_index("p1_name").play_date.to_dict()
+    assert kept == {"Sakamoto R.": 20260813, "Kozlov S.": 20260812}
+    assert dedupe(df.iloc[:0]).empty

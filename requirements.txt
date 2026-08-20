@@ -8,6 +8,7 @@ plotly>=5.20
 openpyxl>=3.1
 xlrd>=2.0
 requests>=2.31
+beautifulsoup4>=4.12   # odds scrapers (tennisexplorer, checkbestodds)
 pyarrow>=15.0
 pytest>=8.0
 matplotlib>=3.8

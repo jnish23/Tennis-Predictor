@@ -37,6 +37,7 @@ page is cached to disk, so a re-run of the same range costs nothing.
 """
 from __future__ import annotations
 
+import gzip
 import logging
 import random
 import re
@@ -44,9 +45,11 @@ import time
 from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 
+import pandas as pd
 import requests
 
 from tennis.config import DATA
+from tennis.db.lock import wait_for_clear
 from tennis.db.schema import connect
 
 log = logging.getLogger(__name__)
@@ -81,22 +84,46 @@ def tour_of(tournament: str) -> str:
 
 _MARKETS = {1: "h2h", 2: "totals", 3: "handicap", 4: "correct_score"}
 
+# Markets written to the database. Correct-score is parsed off the same page --
+# there is no request to save by skipping it -- but it is 22% of all rows for a
+# market this project does not model and has no plan to, which is 2.7 GB of the
+# projected 12.6 GB. Dropping it is free and reversible: the gzipped page cache
+# is the archive, so re-adding a market is a re-parse, not a re-scrape.
+KEEP_MARKETS = {"h2h", "totals", "handicap"}
+
 
 def _sleep() -> None:
     time.sleep(random.uniform(DELAY - JITTER, DELAY + JITTER))
 
 
 def fetch(path: str, *, cache_key: str) -> str:
-    """GET with an on-disk cache. Cached pages never hit the network again."""
+    """GET with a gzipped on-disk cache. Cached pages never hit the network.
+
+    Gzipped because these pages are enormous and there are a lot of them: a
+    match page averages 419 KB of markup, so the full backfill is 194 GB of
+    ATP+Challenger or 432 GB of everything. Measured on real pages gzip gets
+    11.4x, taking those to 17 GB and 38 GB -- the difference between a cache
+    that fits on a laptop and one that does not.
+
+    The cache is not what makes the scrape resumable; `te_scrape_log` is. What
+    it buys is re-parsing without re-fetching, which has already paid for
+    itself once: the line_unit key collision was found after 12 pages were
+    fetched and the fix was verified against them for free.
+    """
     sub = CACHE / cache_key[:6]
     sub.mkdir(parents=True, exist_ok=True)
-    f = sub / f"{cache_key}.html"
-    if f.exists():
-        return f.read_text(encoding="utf-8", errors="replace")
+    gz, plain = sub / f"{cache_key}.html.gz", sub / f"{cache_key}.html"
+    if gz.exists():
+        return gzip.decompress(gz.read_bytes()).decode("utf-8", errors="replace")
+    if plain.exists():                      # migrate anything written earlier
+        text = plain.read_text(encoding="utf-8", errors="replace")
+        gz.write_bytes(gzip.compress(text.encode(), 6))
+        plain.unlink()
+        return text
     _sleep()
     r = requests.get(f"{BASE}{path}", headers={"User-Agent": UA}, timeout=45)
     r.raise_for_status()
-    f.write_text(r.text, encoding="utf-8")
+    gz.write_bytes(gzip.compress(r.text.encode(), 6))
     return r.text
 
 
@@ -238,6 +265,7 @@ def scrape_days(start: date, end: date, *, tour: str = "all",
             n_days += 1
             if n_days % 10 == 0:      # commit in batches, not at the end
                 con.commit()
+                wait_for_clear()
                 log.info("  days %d done, %d matches, %d errors", n_days, n_rows, n_err)
             day += step
         con.commit()
@@ -291,6 +319,8 @@ def parse_detail(html: str, te_id: int) -> list[dict]:
     soup = BeautifulSoup(html, "html.parser")
     out = []
     for tab, market in _MARKETS.items():
+        if market not in KEEP_MARKETS:
+            continue
         div = soup.find(id=f"oddsMenu-{tab}-data")
         if div is None:
             continue
@@ -340,14 +370,33 @@ def parse_detail(html: str, te_id: int) -> list[dict]:
     return out
 
 
-def scrape_details(limit: int | None = None, *, order: str = "recent") -> dict:
-    """Tier B. Picks up wherever it left off; commits every `BATCH` matches."""
+def scrape_details(limit: int | None = None, *, order: str = "recent",
+                   tours: tuple[str, ...] | None = ("atp", "challenger")) -> dict:
+    """Tier B. Picks up wherever it left off; commits every `BATCH` matches.
+
+    Defaults to ATP and Challenger, newest first. WTA ids were banked during
+    Tier A for free but its detail pages are deferred -- pass
+    `tours=None` to include them, or run a separate `--tour wta` pass later.
+    Ordering is by play date so an interrupted run has always finished the
+    recent seasons, which are the ones carrying opening odds and dense games
+    lines.
+    """
     con = connect()
-    sql = ("SELECT te_id FROM te_matches WHERE detail_done=0 ORDER BY play_date "
+    # Doubles are excluded: this project models singles only, and Tier A used
+    # type=all (to bank WTA ids for free) which also swept them in. They are
+    # 20% of the queue -- two days of requests for a market with no model
+    # behind it. The site writes a pair as "Name A / Name B", so the slash is
+    # the discriminator.
+    where = "detail_done=0 AND p1_name NOT LIKE '%/%' AND p2_name NOT LIKE '%/%'"
+    params: tuple = ()
+    if tours:
+        where += f" AND tour IN ({','.join('?' * len(tours))})"
+        params = tuple(tours)
+    sql = (f"SELECT te_id FROM te_matches WHERE {where} ORDER BY play_date "
            + ("DESC" if order == "recent" else "ASC"))
     if limit:
         sql += f" LIMIT {int(limit)}"
-    todo = [r[0] for r in con.execute(sql)]
+    todo = [r[0] for r in con.execute(sql, params)]
     n_ok = n_err = n_q = 0
     try:
         for i, te_id in enumerate(todo, 1):
@@ -376,12 +425,83 @@ def scrape_details(limit: int | None = None, *, order: str = "recent") -> dict:
                 con.commit()
                 log.info("  %d/%d details, %d quotes, %d errors",
                          i, len(todo), n_q, n_err)
+                # Just committed and holding nothing -- the one safe moment to
+                # stand aside for the nightly reload, which needs seconds of
+                # exclusive access and would otherwise fail every night for the
+                # week this runs.
+                wait_for_clear()
         con.commit()
     finally:
         con.commit()
         con.close()
     return {"details": n_ok, "quotes": n_q, "errors": n_err,
             "remaining": max(0, len(todo) - n_ok - n_err)}
+
+
+# --------------------------------------------------------------------------
+# resolving to our own matches
+# --------------------------------------------------------------------------
+def resolve_matches(con=None) -> dict:
+    """Fill `te_matches.match_id` and `p1_is_winner`.
+
+    The two id spaces are unrelated -- `te_id` is tennisexplorer's internal key
+    and `match_id` is built from TennisMyLife data -- so there is nothing to
+    join on but names and dates. Same approach as the tennis-data and
+    checkbestodds joins: an accent-stripped surname+initial key for each player,
+    paired order-independently, matched within a date window.
+
+    The window is +/-7 days because archived seasons stamp a match with the week
+    its tournament began while this source carries the true playing day; a
+    second-week match is legitimately six days adrift. A pair can only meet once
+    inside one tournament, and the nearest date wins regardless.
+
+    `p1_is_winner` is stored once, here. Every quote is keyed on their p1/p2,
+    so orientation has to be resolved exactly once and reused -- deriving it per
+    quote is how sides get silently transposed.
+    """
+    from tennis.ingest.odds_live import surname_key
+
+    close = con is None
+    con = con or connect()
+    try:
+        te = pd.read_sql(
+            "SELECT te_id, play_date, p1_name, p2_name FROM te_matches "
+            "WHERE match_id IS NULL AND p1_name NOT LIKE '%/%' "
+            "AND p2_name NOT LIKE '%/%'", con)
+        if te.empty:
+            return {"resolved": 0, "note": "nothing unresolved"}
+        m = pd.read_sql(
+            """SELECT m.match_id, m.tourney_date, pw.name AS w_name, pl.name AS l_name
+               FROM matches m
+               JOIN players pw ON pw.player_id = m.winner_id
+               JOIN players pl ON pl.player_id = m.loser_id""", con)
+
+        te["k1"] = te.p1_name.map(surname_key)
+        te["k2"] = te.p2_name.map(surname_key)
+        te["pair"] = [tuple(sorted(x)) for x in zip(te.k1, te.k2)]
+        m["kw"] = m.w_name.map(surname_key)
+        m["kl"] = m.l_name.map(surname_key)
+        m["pair"] = [tuple(sorted(x)) for x in zip(m.kw, m.kl)]
+
+        j = te.merge(m, on="pair", how="inner")
+        j["gap"] = (pd.to_datetime(j.play_date.astype(str), format="%Y%m%d")
+                    - pd.to_datetime(j.tourney_date.astype(str), format="%Y%m%d")
+                    ).dt.days.abs()
+        j = j[j.gap <= 7].sort_values("gap")
+        # One te_id per match_id and vice versa: a pair meeting twice in a
+        # season must not fan out into a cross product.
+        j = j.drop_duplicates("te_id").drop_duplicates("match_id")
+
+        j["p1_is_winner"] = (j.k1 == j.kw).astype(int)
+        con.executemany(
+            "UPDATE te_matches SET match_id=?, p1_is_winner=? WHERE te_id=?",
+            list(zip(j.match_id, j.p1_is_winner, j.te_id)))
+        con.commit()
+        return {"candidates": len(te), "resolved": len(j),
+                "rate_pct": round(len(j) / len(te) * 100, 1)}
+    finally:
+        if close:
+            con.close()
 
 
 if __name__ == "__main__":
@@ -394,15 +514,27 @@ if __name__ == "__main__":
                     help="tier A, inclusive, YYYY-MM-DD")
     ap.add_argument("--details", type=int, nargs="?", const=0,
                     help="tier B; optional cap on how many pages this run")
+    ap.add_argument("--tour", default="atp,challenger",
+                    help="tier B tours, comma-separated, or 'all' (default: "
+                         "atp,challenger -- WTA ids are banked but deferred)")
+    ap.add_argument("--oldest-first", action="store_true",
+                    help="tier B: reverse the default newest-first order")
     ap.add_argument("--status", action="store_true")
+    ap.add_argument("--resolve", action="store_true",
+                    help="join scraped matches to our match_id")
     a = ap.parse_args()
-    if a.status:
+    if a.resolve:
+        print(resolve_matches())
+    elif a.status:
         for k, v in status().items():
             print(f"{k}: {v}")
     elif a.days:
         s, e = (datetime.strptime(x, "%Y-%m-%d").date() for x in a.days)
         print(scrape_days(s, e))
     elif a.details is not None:
-        print(scrape_details(a.details or None))
+        tours = None if a.tour == "all" else tuple(
+            t.strip() for t in a.tour.split(",") if t.strip())
+        print(scrape_details(a.details or None, tours=tours,
+                             order="oldest" if a.oldest_first else "recent"))
     else:
         ap.print_help()

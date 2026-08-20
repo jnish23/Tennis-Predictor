@@ -295,6 +295,15 @@ CREATE INDEX IF NOT EXISTS ix_bt_date ON backtest(tourney_date);
 def connect(path: Path | str = DB_PATH) -> sqlite3.Connection:
     con = sqlite3.connect(str(path), timeout=60)
     con.execute("PRAGMA foreign_keys=ON")
+    # NORMAL rather than the FULL default, which is the documented pairing for
+    # WAL: FULL fsyncs on every commit, and during the odds backfill -- which
+    # commits every 25 matches for days while the same database is being
+    # queried -- that was enough to push writers past the 60s busy timeout and
+    # fail 442 pages with "database is locked". Those pages are only ever
+    # retried from the local cache, so nothing was lost, but the stalls are
+    # avoidable. With WAL, NORMAL risks only the last commits on power loss,
+    # and every one of them is re-derivable from the page cache.
+    con.execute("PRAGMA synchronous=NORMAL")
     return con
 
 
