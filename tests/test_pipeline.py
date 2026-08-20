@@ -487,37 +487,44 @@ def test_tourney_xref_prefers_the_right_event_not_the_biggest():
     same top players appear at both, and RG simply has more matches. A date
     window plus Jaccard similarity fixes it.
     """
+    from tennis.db.lock import exclusive_write
     from tennis.db.schema import connect
     from tennis.ingest.draws_api import resolve_tourney_key
 
+    # This test writes to the real database, so it loses the write lock to the
+    # multi-day odds backfill and fails with "database is locked" for as long
+    # as that runs -- which is most of the time. Claim the database the same
+    # way the nightly job does and the backfill yields at its next batch.
     con = connect()
+    con.execute("PRAGMA busy_timeout=60000")
     try:
-        canada = pd.read_sql(
-            "SELECT tourney_key, tourney_date FROM tournaments "
-            "WHERE season=2026 AND name LIKE '%Canada%'", con)
-        if canada.empty:
-            pytest.skip("Canada Masters 2026 not loaded")
-        key = canada.iloc[0]["tourney_key"]
-        players = pd.read_sql(
-            "SELECT winner_id AS p FROM matches WHERE tourney_key=? "
-            "UNION SELECT loser_id FROM matches WHERE tourney_key=?",
-            con, params=(key, key))["p"].tolist()
-        con.execute("DELETE FROM tourney_xref WHERE feed_id='test-xref'")
-        con.commit()
+        with exclusive_write("test_tourney_xref"):
+            canada = pd.read_sql(
+                "SELECT tourney_key, tourney_date FROM tournaments "
+                "WHERE season=2026 AND name LIKE '%Canada%'", con)
+            if canada.empty:
+                pytest.skip("Canada Masters 2026 not loaded")
+            key = canada.iloc[0]["tourney_key"]
+            players = pd.read_sql(
+                "SELECT winner_id AS p FROM matches WHERE tourney_key=? "
+                "UNION SELECT loser_id FROM matches WHERE tourney_key=?",
+                con, params=(key, key))["p"].tolist()
+            con.execute("DELETE FROM tourney_xref WHERE feed_id='test-xref'")
+            con.commit()
 
-        got = resolve_tourney_key("test-xref", "National Bank Open - Montreal",
-                                  players, 2026, "2026-08-03", con)
-        assert got == key, f"resolved to {got}, expected {key}"
+            got = resolve_tourney_key("test-xref", "National Bank Open - Montreal",
+                                      players, 2026, "2026-08-03", con)
+            assert got == key, f"resolved to {got}, expected {key}"
 
-        # second call must come from the cache, not a rescan
-        cached = con.execute(
-            "SELECT tourney_key FROM tourney_xref WHERE feed_id='test-xref'"
-        ).fetchone()
-        assert cached and cached[0] == key
+            # second call must come from the cache, not a rescan
+            cached = con.execute(
+                "SELECT tourney_key FROM tourney_xref WHERE feed_id='test-xref'"
+            ).fetchone()
+            assert cached and cached[0] == key
 
-        # an unrelated field must not resolve to anything
-        assert resolve_tourney_key("test-xref-2", "Nowhere Open",
-                                   ["NOPE1", "NOPE2"], 2026, "2026-08-03", con) is None
+            # an unrelated field must not resolve to anything
+            assert resolve_tourney_key("test-xref-2", "Nowhere Open",
+                                       ["NOPE1", "NOPE2"], 2026, "2026-08-03", con) is None
     finally:
         con.execute("DELETE FROM tourney_xref WHERE feed_id LIKE 'test-xref%'")
         con.commit()
@@ -564,7 +571,10 @@ def test_bracket_prices_only_decided_ties():
     from tennis.sim.bracket import bracket_state
 
     rounds = bracket_state(_draw(8), _FlatPredictor(), resolved=None)
-    assert [rd["round"] for rd in rounds] == ["SF", "Final", "Champion"]
+    # Eight players play a QF, an SF and a final. This previously asserted
+    # ["SF", "Final", "Champion"], which was the reached-stage vocabulary
+    # applied to the round being played -- every label off by one step.
+    assert [rd["round"] for rd in rounds] == ["QF", "SF", "F"]
     first = rounds[0]["ties"]
     assert all(t["state"] == "live" for t in first)
     assert all(t.get("p1_win_prob") is not None for t in first)
@@ -1302,3 +1312,104 @@ def test_dedupe_fixtures_keys_on_the_pairing_not_the_date():
     kept = out.set_index("p1_name").play_date.to_dict()
     assert kept == {"Sakamoto R.": 20260813, "Kozlov S.": 20260812}
     assert dedupe(df.iloc[:0]).empty
+
+
+def test_draw_sheet_finds_the_seed_when_the_sentinel_holds_player1():
+    """A bye row puts the sentinel on whichever side the real player is not.
+
+    Cincinnati 2026 used both orientations: Zverev and Paul sat in player1 with
+    "Unknown Player" below them, while Etcheverry and Vacherot sat in player2
+    with the sentinel *above*. Reading p1 blindly kept the sentinel as the bye
+    holder and dropped the real seed, so 16 of the 32 seeds in a 96-draw
+    vanished from the bracket -- and the ones left behind showed as
+    "Unknown Player, bye".
+    """
+    from tennis.ingest.draws_api import parse_draw_sheet
+
+    payload = {"data": {"singles": [
+        {"roundId": 4, "draw": 1, "result": "bye", "seed1": "1", "seed2": None,
+         "player1Id": 100, "player2Id": 3700,
+         "player1": {"id": 100, "name": "Top Seed", "seed": "1"},
+         "player2": {"id": 3700, "name": "Unknown Player"}},
+        # same bye, mirrored: the seed is in player2
+        {"roundId": 4, "draw": 2, "result": "bye", "seed1": None, "seed2": "26",
+         "player1Id": 3700, "player2Id": 200,
+         "player1": {"id": 3700, "name": "Unknown Player"},
+         "player2": {"id": 200, "name": "Mirrored Seed", "seed": "26"}},
+    ], "doubles": [], "qualifying": []}}
+
+    sheet = parse_draw_sheet(payload)
+    assert int(sheet["is_bye"].sum()) == 2
+    # Both seeds survive, and neither slot is held by the sentinel.
+    assert list(sheet["p1_name"]) == ["Top Seed", "Mirrored Seed"]
+    assert "Unknown Player" not in set(sheet["p1_name"])
+    assert sheet["p2_name"].isna().all()
+    # The seed travels with the player it belongs to, not with the slot.
+    assert list(sheet["seed1"]) == ["1", "26"]
+
+
+def test_bracket_labels_the_round_being_played_not_the_stage_reached():
+    """A 128-draw opens with the R128, and the tour names it that way.
+
+    `round_names` deliberately names the stage a player *reached* by winning
+    round r, which is what `simulate` counts and what `_actual_progression`
+    joins against. Using those labels on a bracket shifts every column by one:
+    Cincinnati's opening round showed as "R64" and the real R16 was captioned
+    "QF". The bracket needs the round itself.
+    """
+    from tennis.sim.bracket import playing_round_names, round_names
+
+    assert playing_round_names(7) == ["R128", "R64", "R32", "R16", "QF", "SF", "F"]
+    assert playing_round_names(6) == ["R64", "R32", "R16", "QF", "SF", "F"]
+    assert playing_round_names(3) == ["QF", "SF", "F"]
+    assert playing_round_names(1) == ["F"]
+    # The two vocabularies must stay distinct and offset by exactly one step.
+    assert round_names(7)[0] == "R64" and playing_round_names(7)[0] == "R128"
+    assert playing_round_names(7)[1:-1] == round_names(7)[:-2]
+    # Matches the `round` vocabulary the matches table uses.
+    assert set(playing_round_names(7)) <= {"R128", "R64", "R32", "R16",
+                                           "QF", "SF", "F"}
+
+
+def test_single_instance_refuses_a_second_live_run(tmp_path, monkeypatch):
+    """A second copy of the scraper must refuse to start, not silently double up.
+
+    Every write the scraper makes is idempotent by primary key, so a duplicate
+    run corrupts nothing and is therefore invisible -- two `--details` runs
+    overlapped for nine hours before anyone noticed. What it does cost is a
+    doubled request rate against a site we deliberately rate-limit, and a pile
+    of re-fetched pages.
+    """
+    import json
+    import os
+    import subprocess
+
+    from tennis.db import lock as lockmod
+
+    monkeypatch.setattr(lockmod, "DATA", tmp_path)
+    pf = tmp_path / ".running-job"
+
+    # A live foreign pid holds the job: we must be refused.
+    proc = subprocess.Popen(["sleep", "30"])
+    try:
+        pf.write_text(json.dumps({"pid": proc.pid, "name": "job",
+                                  "since": "2026-08-19T13:07:22"}))
+        with pytest.raises(lockmod.AlreadyRunning) as exc:
+            with lockmod.single_instance("job"):
+                pass
+        assert str(proc.pid) in str(exc.value)
+    finally:
+        proc.kill()
+        proc.wait()
+
+    # The pid is dead now, so the job may take over -- a crash must not lock
+    # the job out permanently.
+    with lockmod.single_instance("job"):
+        assert json.loads(pf.read_text())["pid"] == os.getpid()
+    assert not pf.exists()          # cleaned up on the way out
+
+    # A stale file for a dead pid is cleared rather than honoured.
+    pf.write_text(json.dumps({"pid": proc.pid, "name": "job", "since": "x"}))
+    with lockmod.single_instance("job"):
+        pass
+    assert not pf.exists()

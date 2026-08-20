@@ -66,6 +66,27 @@ def round_names(n_rounds: int) -> list[str]:
     return extra + base[7]
 
 
+def playing_round_names(n_rounds: int) -> list[str]:
+    """Label rounds by the round *being played*, the way the tour names them.
+
+    Distinct from `round_names`, and the two must not be swapped. That one
+    names the stage a player has *reached* by winning round r, which is what
+    `simulate` counts and what `_actual_progression` joins against column for
+    column. This one names the round r itself, which is what a bracket shows.
+    They differ by exactly one step, so using the reached-stage names on a
+    bracket labels the opening round of a 128-draw "R64" and shifts every
+    other column with it -- the round that is really the R16 ends up captioned
+    "QF". Cincinnati is a 96-draw padded to 128 slots and showed precisely
+    that.
+
+    Naming follows the field size, so it matches the `round` vocabulary in the
+    matches table (R128, R64, ..., QF, SF, F) for any draw size.
+    """
+    special = {8: "QF", 4: "SF", 2: "F"}
+    return [special.get(2 ** (n_rounds - r), f"R{2 ** (n_rounds - r)}")
+            for r in range(n_rounds)]
+
+
 def simulate(draw: Draw, predictor: Predictor, n_sims: int = 10_000,
              seed: int | None = 42,
              resolved: dict[int, dict[int, str]] | None = None) -> pd.DataFrame:
@@ -194,7 +215,9 @@ def bracket_state(draw: Draw, predictor, resolved: dict | None = None,
     # {(winner_id, loser_id): "7-6(3) 6-4"} -- supplied by whoever knows the
     # results, since the simulator itself has no notion of a scoreline.
     scores = scores or {}
-    labels = round_names(draw.n_rounds)
+    # The round being played, not the stage its winners reach -- see
+    # `playing_round_names`. A bracket column is the round itself.
+    labels = playing_round_names(draw.n_rounds)
     field = list(draw.slots)
 
     # First pass: work out the shape and gather the ties that need pricing.
