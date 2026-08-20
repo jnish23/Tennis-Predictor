@@ -23,6 +23,7 @@ def matches():
     return df
 
 
+@pytest.mark.needs_db
 def test_prefix_invariance(matches):
     """A match's features must not change when later matches are added.
 
@@ -45,6 +46,7 @@ def test_prefix_invariance(matches):
         assert np.allclose(a, b, equal_nan=True), f"feature {c} changed with future data"
 
 
+@pytest.mark.needs_db
 def test_first_appearance_has_no_history(matches):
     """A player's very first match must carry no form/serve history."""
     sub = matches.iloc[:50_000]
@@ -71,6 +73,8 @@ def test_first_appearance_has_no_history(matches):
     assert checked > 100
 
 
+@pytest.mark.needs_db
+@pytest.mark.features
 def test_no_same_match_stats_in_features():
     """No feature column may be a raw same-match stat column."""
     from tennis.features.pipeline import FEATURES_PATH

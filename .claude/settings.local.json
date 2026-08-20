@@ -84,7 +84,21 @@
       "Bash(.venv/bin/python -m tennis.ingest.odds_te_hist --days 2026-07-28 2026-07-31)",
       "Bash(.venv/bin/python -m tennis.ingest.odds_te_hist --days 2026-07-24 2026-07-27)",
       "Bash(nohup .venv/bin/python -m tennis.ingest.odds_te_hist --days 2005-01-01 2026-08-10)",
-      "Bash(.venv/bin/python -m tennis.ingest.odds_te_hist --status)"
+      "Bash(.venv/bin/python -m tennis.ingest.odds_te_hist --status)",
+      "Bash(awk '{printf \"cache now: %.1f MB\\\\n\", $1/1024}')",
+      "Bash(awk -F: '{print $1\" \"$3}')",
+      "Bash(TENNIS_DB=/nonexistent .venv/bin/python -)",
+      "Bash(.venv/bin/python -m tennis.ingest.odds_te_hist --details 3)",
+      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py::test_tourney_xref_prefers_the_right_event_not_the_biggest -q)",
+      "Bash(.venv/bin/python -c \"import tennis.ingest.load, tennis.ingest.odds_te_hist; print\\('imports clean'\\)\")",
+      "Bash(.venv/bin/python -m tennis.features.pipeline --incremental)",
+      "Bash(.venv/bin/python -m tennis.ingest.odds_te_hist --resolve)",
+      "Bash(.venv/bin/python scripts/totals_vs_market.py)",
+      "Bash(../.venv/bin/python backtest_lines.py)",
+      "Bash(../.venv/bin/python -)",
+      "Bash(KILL_EXISTING=1 nohup bash scripts/run_dashboard.sh)",
+      "Bash(nohup .venv/bin/streamlit run dashboard/app.py --server.port 8502 --server.headless true)",
+      "Bash(curl -s -o /dev/null -w \"dashboard %{http_code}\\\\n\" http://localhost:8502)"
     ]
   }
 }

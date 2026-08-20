@@ -66,6 +66,34 @@ Option B.
 
 To remove them: `launchctl unload ~/Library/LaunchAgents/com.tennis.{odds,daily,weekly}.plist`.
 
+## Reaching the dashboard from elsewhere
+
+```bash
+./scripts/serve.sh
+```
+
+Binds to all interfaces and prints the tailnet address. Install Tailscale, sign
+in on both machines, and the dashboard is reachable from anywhere without being
+exposed to the internet.
+
+This is deliberately the *only* thing that leaves the machine. The collector is
+stateful -- a database heading for ~10 GB once the odds backfill lands, a
+gzipped scrape cache, jobs that run for days -- so it stays put and only the
+view travels. Moving it to a VPS later is a lift-and-shift of the systemd unit
+in this directory, not a redesign.
+
+## What does *not* run in CI, and why
+
+`.github/workflows/tests.yml` runs the logic tests on every push and nothing
+else. The scheduled jobs cannot run there: Actions caps a job at 6 hours and
+gives ephemeral disks, while the odds backfill runs for days against persistent
+state, and the free tier's 2,000 minutes a month is dwarfed by the ~34,000 that
+backfill needs. Committing the database to make it portable is worse still --
+a 256 MB binary rewritten daily, with unresolvable merge conflicts.
+
+Data-dependent tests mark themselves `needs_db` and skip on a clean checkout;
+47 of 62 run without any data, and the workflow fails if that number drops.
+
 **Why the odds capture is its own agent.** The daily job is heavy and only needs
 to run once, after play. The capture is two HTTP requests, and its value depends
 entirely on running often: only the price nearest a match's start can honestly

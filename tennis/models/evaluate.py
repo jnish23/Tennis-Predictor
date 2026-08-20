@@ -42,8 +42,22 @@ def load_backtest() -> pd.DataFrame:
     return pd.read_parquet(ARTIFACTS / "backtest.parquet")
 
 
-def attach_odds(bt: pd.DataFrame, book: str = "PS") -> pd.DataFrame:
-    """Attach closing prices, re-oriented from winner/loser to p1/p2."""
+def attach_odds(bt: pd.DataFrame, book: str = "PS",
+                devig: str = "shin") -> pd.DataFrame:
+    """Attach closing prices, re-oriented from winner/loser to p1/p2.
+
+    `devig` defaults to Shin rather than proportional. Proportional assumes the
+    margin is spread evenly across the two sides, which books do not do -- they
+    load it onto the longshot. Scored against realised outcomes on 523,879
+    quotes across 18 books, Shin beat proportional in 16 of 17, and its
+    advantage tracks how much margin a book charges (r = 0.72, p = 0.001). The
+    one book it does not help is Betfair, an exchange, which has no bookmaker
+    margin to misallocate in the first place.
+
+    The effect on any single probability is small -- about a point on a heavy
+    favourite -- but it is the *benchmark* every model-vs-market comparison in
+    this project is measured against, so a bias here biases all of them.
+    """
     con = connect()
     odds = pd.read_sql(
         "SELECT match_id, book, win_price, lose_price FROM odds WHERE book=?",
@@ -54,8 +68,14 @@ def attach_odds(bt: pd.DataFrame, book: str = "PS") -> pd.DataFrame:
     out["p1_price"] = np.where(out["y_win"] == 1, out["win_price"], out["lose_price"])
     out["p2_price"] = np.where(out["y_win"] == 1, out["lose_price"], out["win_price"])
     # De-vig to a fair market probability for comparison.
-    inv1, inv2 = 1 / out["p1_price"], 1 / out["p2_price"]
-    out["mkt_p1"] = inv1 / (inv1 + inv2)
+    from tennis.models.devig import METHODS
+
+    ok = out["p1_price"].notna() & out["p2_price"].notna()
+    out["mkt_p1"] = np.nan
+    if ok.any():
+        pair = out.loc[ok, ["p1_price", "p2_price"]].to_numpy(float)
+        out.loc[ok, "mkt_p1"] = METHODS[devig](pair)[:, 0]
+    out["devig"] = devig
     out["book"] = book
     return out
 
@@ -274,6 +294,24 @@ def full_report(book: str = "PS") -> dict:
     ms = rep["market_subset"]
     beats_close = (ms["model"]["log_loss"] < ms["market_closing"]["log_loss"]
                    if ms.get("n") else None)
+    # Real games-market comparison. Guarded: it depends on the tennisexplorer
+    # backfill, which may be absent, partial, or paused. A missing block is a
+    # normal state, not a failure, and the dashboard renders accordingly.
+    try:
+        from tennis.models.lines import clv, market_comparison
+        con = connect()
+        try:
+            mc = market_comparison(con, bt)
+            if mc.get("markets"):
+                mc["clv"] = clv(con, bt)
+                rep["market_lines"] = mc
+                log.info("market_lines: %s", {k: v["matches"]
+                                              for k, v in mc["markets"].items()})
+        finally:
+            con.close()
+    except Exception as exc:
+        log.warning("market-line comparison skipped: %s", exc)
+
     rep["headline"] = {
         "winner_beats_elo_baseline": rep["winner"]["log_loss"] < rep["winner_elo_baseline"]["log_loss"],
         "winner_beats_closing_line": beats_close,

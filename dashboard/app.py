@@ -395,7 +395,7 @@ def page_backtest() -> None:
             "n": len(g),
         }), include_groups=False).reset_index()
 
-    tab1, tab2, tab3 = st.tabs(["Over time", "Breakouts", "ROI"])
+    tab1, tab2, tab3 = st.tabs(["Over time", "Breakouts", "Market"])
     with tab1:
         fig = px.line(per, x="season", y=["log_loss", "brier"], markers=True,
                       title="Winner model error by season")
@@ -474,45 +474,7 @@ def page_backtest() -> None:
 
         _roi_by_season(rep)
 
-        st.subheader("Totals & spread — synthetic line, not a market")
-        st.warning(
-            "tennis-data.co.uk publishes match-winner prices only; there are no "
-            "totals or handicap lines in any season of the free data, so a real "
-            "closing-line ROI for these two targets **cannot be computed**. The "
-            "rows below bet the model against a naive historical-average line at "
-            "-110. That reference line barely moves (see its std vs the actual "
-            "std), so these ROI figures are inflated by the line's weakness and "
-            "are **not** a profitability estimate — read them only as evidence "
-            "the model carries signal."
-        )
-
-        def _synth_table(block: dict) -> pd.DataFrame:
-            return pd.DataFrame([
-                {
-                    "edge": k.replace("edge_", ""),
-                    "bets": int(v.get("bets", 0)),
-                    "roi_pct": float(v.get("roi_pct", 0)),
-                    "hit_rate": float(v.get("hit_rate", float("nan"))),
-                }
-                for k, v in block.items() if v.get("bets")
-            ])
-
-        cA, cB = st.columns(2)
-        cA.markdown("**Totals (games)**")
-        show_table(_synth_table(rep["roi_totals_synthetic"]), cA)
-        cB.markdown("**Spread (games)**")
-        show_table(_synth_table(rep["roi_spread_synthetic"]), cB)
-
-        base = next((v.get("baseline") for v in rep["roi_totals_synthetic"].values()
-                     if v.get("baseline")), None)
-        if base:
-            st.caption(
-                f"Reference line quality — model MAE {base['model_mae']} vs "
-                f"reference MAE {base['reference_line_mae']}; reference line std "
-                f"{base['reference_line_std']} against actual std "
-                f"{base['actual_std']}. A near-constant line is easy to beat, "
-                f"which is exactly why the ROI above overstates real edge."
-            )
+        _market_lines(rep)
 
 
 def _hit_rate_explainer(rep: dict) -> None:
@@ -558,6 +520,97 @@ both columns fall together — a lower hit rate at edge 0.10 is not a worse mode
 """
         )
 
+
+
+def _market_lines(rep: dict) -> None:
+    """The three models against their own markets, plus closing-line value.
+
+    Precomputed by `models/lines.py` during evaluation and read from the report:
+    it rests on 15M+ rows of `odds_quotes`, which the dashboard must never touch
+    at render time. A missing block means the tennisexplorer backfill has not
+    run, which is a normal state rather than an error.
+    """
+    ml = rep.get("market_lines")
+    if not ml or not ml.get("markets"):
+        st.subheader("Totals & spread — synthetic line, not a market")
+        st.info(
+            "No games-market comparison in this report. Run the tennisexplorer "
+            "backfill (`tennis/ingest/odds_te_hist.py`) and re-run evaluation to "
+            "replace this with the real thing."
+        )
+        return
+
+    st.subheader("All three models against their own market")
+    ms = rep.get("market_subset", {})
+    rows = []
+    if ms:
+        rows.append({
+            "market": "winner (moneyline)", "matches": f"{ms['n']:,}",
+            "model": f"{ms['model']['log_loss']:.5f}",
+            "market_": f"{ms['market_closing']['log_loss']:.5f}",
+            "gap": f"{ms['model']['log_loss'] - ms['market_closing']['log_loss']:+.5f}",
+            "vig %": "—", "source": "Pinnacle close",
+        })
+    for name, m in ml["markets"].items():
+        rows.append({
+            "market": f"{name} (games)", "matches": f"{m['matches']:,}",
+            "model": f"{m['model_ll']:.5f}", "market_": f"{m['market_ll']:.5f}",
+            "gap": f"{m['gap']:+.5f}", "vig %": f"{m['median_vig_pct']:.1f}",
+            "source": f"books avg, {m['seasons'][0]}–{m['seasons'][1]}",
+        })
+    show_table(pd.DataFrame(rows).rename(columns={"market_": "market"}))
+    st.caption(
+        "Log loss; **gap** is model minus market, so positive means the market "
+        "is better. The point is that the three gaps are *similar* — no single "
+        "model is the weak link. Totals and spread rest on the tennisexplorer "
+        "backfill, which covers fewer matches and fewer seasons than the winner "
+        "row, so the counts are not comparable."
+    )
+
+    tiers = {n: m.get("by_tier", {}) for n, m in ml["markets"].items()}
+    if any(tiers.values()):
+        st.markdown(
+            "**By tier.** The totals gap is five times smaller on Challengers "
+            "(0.004 against 0.018) — the smallest gap anywhere in this project. "
+            "Spread shows no such split: the two tiers are within 0.00004 of "
+            "each other, so whatever makes Challenger *totals* easier to price "
+            "relative to the market does not carry over to the handicap.")
+        trows = []
+        for name, by in tiers.items():
+            for tier, v in by.items():
+                trows.append({"market": f"{name} (games)", "tier": tier,
+                              "rows": f"{v['rows']:,}",
+                              "model": f"{v['model_ll']:.5f}",
+                              "market ": f"{v['market_ll']:.5f}",
+                              "gap": f"{v['gap']:+.5f}"})
+        show_table(pd.DataFrame(trows))
+
+    c = ml.get("clv", {})
+    if c.get("markets"):
+        st.subheader("Closing-line value")
+        crows = []
+        for name, v in c["markets"].items():
+            crows.append({
+                "market": f"{name} (games)", "bets": f"{v['bets']:,}",
+                "mean CLV (pts)": f"{v['mean_clv_pts']:+.3f}",
+                "beat close %": f"{v['beat_close_pct']:.1f}",
+                "z": f"{v['z']:+.1f}",
+                "vig to overcome (pts)": f"{v['vig_to_overcome_pts']:.1f}",
+            })
+        show_table(pd.DataFrame(crows))
+        st.warning(
+            "**Signal, not profit — and the last column is why.** These bets are "
+            "placed at "
+            f"{c.get('book','Pinnacle')}'s *opening* line and scored against the "
+            "close, one bet per match. The value is real and statistically "
+            "overwhelming: the market moves toward us more often than not. But "
+            "the margin on those same lines is 3–4 points, so the edge covers "
+            "roughly a tenth of what totals needs and a third of what spread "
+            "needs. Read the CLV column and the vig column together or not at "
+            "all. Some of the value is also likely *timing* rather than "
+            "modelling — our features are as-of-match while an opening line can "
+            "be days old."
+        )
 
 def _roi_by_season(rep: dict) -> None:
     blocks = rep.get("roi_winner_by_season")
@@ -1771,9 +1824,211 @@ def page_status() -> None:
         st.json(json.loads(p.read_text()))
 
 
+def dedupe_fixtures(df: pd.DataFrame) -> pd.DataFrame:
+    """Latest priced capture per *pairing*, not per (pairing, date).
+
+    A postponed or re-listed match carries a new play_date, so keying on the
+    date let one fixture through three times over -- and on the betting page a
+    duplicated fixture is a tripled stake on a single result. Names are sorted
+    into the key because the site's p1/p2 order is not stable between captures;
+    the surviving row keeps whatever orientation it was captured with.
+    """
+    if df.empty:
+        return df
+    pair = pd.DataFrame({"a": df.p1_name, "b": df.p2_name})
+    return (df.assign(_pair=pair.min(axis=1) + "|" + pair.max(axis=1))
+              .sort_values("captured_at").drop_duplicates("_pair", keep="last")
+              .drop(columns="_pair"))
+
+
+@st.cache_data(show_spinner=False)
+def _upcoming(max_age_days: int = 3) -> pd.DataFrame:
+    """Fixtures from the most recent live capture, with their moneyline.
+
+    `odds_snapshots` holds one row per capture, so the latest capture per
+    fixture is the freshest price we hold. Stale captures are surfaced rather
+    than hidden -- a price from three days ago is not a price you can bet.
+    """
+    con = connect()
+    try:
+        last = con.execute("SELECT MAX(play_date) FROM odds_snapshots").fetchone()[0]
+        if last is None:
+            return pd.DataFrame()
+        df = pd.read_sql(
+            "SELECT * FROM odds_snapshots WHERE play_date >= ? ",
+            con, params=(int(last) - max_age_days,))
+        players = pd.read_sql(
+            "SELECT player_id, name, last_seen FROM players", con)
+    finally:
+        con.close()
+    if df.empty:
+        return df
+    df = dedupe_fixtures(df[df.p1_odds.notna() & df.p2_odds.notna()])
+
+    from tennis.ingest.odds_live import surname_key
+    # Most-recently-active player wins a key collision; two players can share a
+    # surname and initial, and the active one is overwhelmingly the fixture.
+    players["key"] = players.name.map(surname_key)
+    players = (players.sort_values("last_seen", ascending=False)
+                      .drop_duplicates("key"))
+    lookup = dict(zip(players.key, players.player_id))
+    df["p1_id"] = df.p1_name.map(surname_key).map(lookup)
+    df["p2_id"] = df.p2_name.map(surname_key).map(lookup)
+    return df
+
+
+def _kelly(p: np.ndarray, price: np.ndarray, cap: float) -> np.ndarray:
+    """Fractional Kelly, capped. Negative edges stake nothing."""
+    b = price - 1
+    f = (p * b - (1 - p)) / np.where(b > 0, b, np.nan)
+    return np.clip(np.nan_to_num(f), 0, cap)
+
+
+def page_betting() -> None:
+    st.header("Betting")
+    st.caption(
+        "Model probability against the live moneyline for upcoming fixtures. "
+        "Expected value is shown beside **what that expected value has "
+        "historically actually returned**, because the two are not the same "
+        "number and only one of them is measured."
+    )
+    if not models_ready():
+        st.warning("No trained models found.")
+        return
+
+    df = _upcoming()
+    if df.empty:
+        st.info("No captured fixtures. Run `scripts/capture_odds.sh`.")
+        return
+
+    last_cap = pd.to_datetime(df.captured_at.max())
+    age_h = (pd.Timestamp.now(tz="UTC") - last_cap.tz_localize("UTC")
+             if last_cap.tzinfo is None else
+             pd.Timestamp.now(tz="UTC") - last_cap).total_seconds() / 3600
+    if age_h > 6:
+        st.error(
+            f"Latest capture is **{age_h:.0f} hours old** ({last_cap:%Y-%m-%d %H:%M} "
+            "UTC). These are not currently bettable prices — the capture agent "
+            "(`com.tennis.odds`) is not running, or the backfill is holding the "
+            "database. Shown for inspection only."
+        )
+    else:
+        st.caption(f"Latest capture {last_cap:%Y-%m-%d %H:%M} UTC "
+                   f"({age_h:.1f}h ago).")
+
+    unresolved = int(df.p1_id.isna().sum() + df.p2_id.isna().sum())
+    d = df.dropna(subset=["p1_id", "p2_id"]).copy()
+    if d.empty:
+        st.warning("No fixtures resolved to known players.")
+        return
+
+    c1, c2, c3 = st.columns(3)
+    edge = c1.slider("Minimum edge (EV)", 0.0, 0.25, 0.05, step=0.01)
+    cap = c2.slider("Kelly cap (fraction of bank)", 0.005, 0.05, 0.02, step=0.005)
+    bank = c3.number_input("Bankroll", min_value=0.0, value=1000.0, step=100.0)
+
+    from tennis.models.devig import shin
+    from tennis.models.predict import MatchContext
+
+    pred = get_predictor()
+    rows = []
+    for r in d.itertuples():
+        ctx = MatchContext(surface="Hard", level="atp250", best_of=3,
+                           is_challenger=int("challenger" in
+                                             (r.tournament or "").lower()))
+        try:
+            pm = float(pred.predict_many([(r.p1_id, r.p2_id)], ctx)
+                       .iloc[0]["p1_win_prob"])
+        except Exception:
+            continue
+        mk = shin(np.array([[r.p1_odds, r.p2_odds]], dtype=float))[0][0, 0]
+        ev1, ev2 = pm * r.p1_odds - 1, (1 - pm) * r.p2_odds - 1
+        side1 = ev1 >= ev2
+        rows.append({
+            "Tournament": r.tournament, "Time": r.start_time or "",
+            "Pick": r.p1_name if side1 else r.p2_name,
+            "Against": r.p2_name if side1 else r.p1_name,
+            "Price": r.p1_odds if side1 else r.p2_odds,
+            "Model %": round((pm if side1 else 1 - pm) * 100, 1),
+            "Market %": round((mk if side1 else 1 - mk) * 100, 1),
+            "EV %": round(max(ev1, ev2) * 100, 1),
+            "_p": pm if side1 else 1 - pm,
+            "_price": r.p1_odds if side1 else r.p2_odds,
+        })
+    if not rows:
+        st.warning("No fixtures could be priced.")
+        return
+
+    t = pd.DataFrame(rows)
+    t["Stake"] = (_kelly(t._p.to_numpy(), t._price.to_numpy(), cap) * bank).round(2)
+    shown = t[t["EV %"] >= edge * 100].sort_values("EV %", ascending=False)
+
+    st.subheader(f"{len(shown)} of {len(t)} fixtures clear a {edge:.0%} edge")
+    if unresolved:
+        st.caption(f"{unresolved} player name(s) did not resolve and were skipped.")
+    if shown.empty:
+        st.info("Nothing clears that threshold.")
+    else:
+        show_table(shown.drop(columns=["_p", "_price"]))
+        big = shown[shown["EV %"] >= 50]
+        if len(big):
+            st.warning(
+                f"**The {len(big)} row(s) above 50% EV are the least trustworthy "
+                "on this page, not the most.** They are cases where the model "
+                "disagrees violently with the price, and disagreement is exactly "
+                "where it has been measured to be worst: split by how far model "
+                "and market diverge, the market wins *every* bucket, and the gap "
+                "widens with the disagreement — where the model is 10pts above "
+                "the price it scores 0.653 log loss against the market's 0.601. "
+                "A 160% EV is not a 160% edge; it is the model being wrong about "
+                "a longshot."
+            )
+
+    _betting_reality(edge)
+
+
+def _betting_reality(edge: float) -> None:
+    """What this strategy actually returned, measured, next to the EV above.
+
+    This is the part that makes the screen honest rather than merely accurate.
+    Expected value is what the model *thinks*; these are the realised numbers
+    from the walk-forward backtest against real closing prices, and they are the
+    better estimate of what the rows above will do.
+    """
+    rep = load_report() or {}
+    roi = rep.get("roi_winner", {})
+    if not roi:
+        return
+    st.subheader("What this has actually returned")
+    rows = []
+    for k, v in roi.items():
+        if not v.get("bets"):
+            continue
+        rows.append({
+            "edge": k.replace("edge_", ""),
+            "bets": f"{v['bets']:,}",
+            "ROI %": f"{v.get('roi_pct', float('nan')):+.2f}",
+            "hit %": f"{v.get('hit_rate', float('nan')) * 100:.1f}",
+            "break-even %": f"{v.get('breakeven_hit_rate', float('nan')) * 100:.1f}",
+        })
+    show_table(pd.DataFrame(rows))
+    hl = rep.get("headline", {})
+    best = hl.get("best_winner_roi_pct")
+    st.error(
+        "**Every threshold above loses money.** These are walk-forward results "
+        "against real Pinnacle closing prices"
+        + (f"; the best of them is {best:+.2f}%. " if best is not None else ". ")
+        + "The EV column in the table above is the model's own opinion of its "
+        "edge; this table is what that opinion was worth when it was tested. "
+        "Where they disagree, this one is the evidence. The model's measured "
+        "value is as a calibrated probability source, not a staking signal."
+    )
+
+
 PAGES = {
     "Tournament simulation": page_simulation,
     "Match predictions": page_predictions,
+    "Betting": page_betting,
     "Backtest performance": page_backtest,
     "Calibration": page_calibration,
     "Elo ratings": page_ratings,

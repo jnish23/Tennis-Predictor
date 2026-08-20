@@ -1,0 +1,56 @@
+name: tests
+
+# CI runs the logic tests only, and that is the whole intent.
+#
+# This project's pipeline is stateful -- a 256 MB SQLite database, a 31 MB
+# feature-engine pickle, a gzipped scrape cache -- and none of it is in version
+# control. Reconstructing it on a runner would mean re-scraping several sources
+# from datacenter IPs for hours, so the data-dependent tests mark themselves
+# `needs_db` and skip here (see tests/conftest.py). What runs is everything that
+# needs no data: parsers, simulator invariants, and the regression tests that
+# pin bugs which were expensive to find -- the odds primary-key collision, the
+# bracket geometry, the season boundary, the price-cell relabelling.
+#
+# The scheduled jobs deliberately do NOT live here. They need persistent state
+# and run for days; Actions gives 6-hour jobs and ephemeral disks. They run
+# under launchd/cron on the collector -- see deploy/README.md.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install pytest
+
+      - name: Run tests
+        run: pytest tests/ -q --no-header
+
+      - name: Fail if the data-free suite shrank
+        # Guards against the skip mechanism quietly swallowing the suite: if a
+        # future change makes a logic test depend on the database, the count
+        # drops and this catches it rather than CI staying green on less work.
+        run: |
+          COUNT=$(pytest tests/ -q --no-header --collect-only 2>/dev/null | grep -c '::' || true)
+          RAN=$(pytest tests/ -q --no-header 2>&1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
+          echo "collected $COUNT, ran $RAN without a database"
+          if [ "$RAN" -lt 40 ]; then
+            echo "::error::only $RAN tests ran without data (expected >=40)"
+            exit 1
+          fi

@@ -9,3 +9,7 @@ __pycache__/
 data/
 artifacts/
 .env
+
+# Stray/scratch data pulls. Same policy as data/ above: rebuildable, not versioned.
+tml-data/
+notebooks/*.csv

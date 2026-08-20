@@ -304,12 +304,41 @@ def load_all(db_path=None) -> dict:
     tourneys = build_tournaments(df)
     matches = df[[c for c in MATCH_COLS if c in df.columns]]
 
-    con.execute("DELETE FROM matches")
-    con.execute("DELETE FROM tournaments")
-    con.execute("DELETE FROM players")
-    players.to_sql("players", con, if_exists="append", index=False)
-    tourneys.to_sql("tournaments", con, if_exists="append", index=False)
-    matches.to_sql("matches", con, if_exists="append", index=False)
+    # BEGIN IMMEDIATE takes the write lock up front. Without it this block is
+    # a live grenade: it deletes all three tables and *then* inserts, so any
+    # failure in between leaves them empty. That is not hypothetical -- on
+    # 2026-08-18 the nightly run collided with the odds backfill, the inserts
+    # raised "database is locked" after the deletes had landed, and the entire
+    # 200,918-row matches table was destroyed. Taking the lock first means a
+    # busy database fails here, before anything is deleted, instead of halfway
+    # through.
+    # Claim first so the odds backfill stands down at its next batch, then
+    # take SQLite's write lock. Claiming without BEGIN IMMEDIATE would still
+    # race an uncooperative writer; BEGIN IMMEDIATE without claiming just loses
+    # the race politely every night.
+    with exclusive_write("nightly match reload"):
+        con.execute("BEGIN IMMEDIATE")
+        try:
+            con.execute("DELETE FROM matches")
+            con.execute("DELETE FROM tournaments")
+            con.execute("DELETE FROM players")
+            players.to_sql("players", con, if_exists="append", index=False)
+            tourneys.to_sql("tournaments", con, if_exists="append", index=False)
+            matches.to_sql("matches", con, if_exists="append", index=False)
+            con.commit()
+        except Exception:
+            con.rollback()
+            raise
+
+    # pandas commits inside to_sql, so the transaction above is a guard against
+    # starting on a locked database rather than a guarantee of atomicity across
+    # all three inserts. Verify the outcome directly: an empty matches table is
+    # always a failure, never a legitimate state.
+    n = con.execute("SELECT COUNT(*) FROM matches").fetchone()[0]
+    if n == 0:
+        raise RuntimeError(
+            "matches table is empty after load -- refusing to leave the "
+            "database in this state; re-run with no other writer active")
 
     # rankings snapshots (rank as recorded at match time)
     rk = pd.concat([

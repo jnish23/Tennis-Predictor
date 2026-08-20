@@ -117,13 +117,15 @@ website, is the working copy.
 
 Three findings that shape what the system can claim:
 
-1. **No totals or handicap lines exist** in either odds source — any season, any
-   bookmaker. Only match-winner prices. So market-relative ROI is reportable for
-   the winner model only. The totals/spread "ROI" in the report is a synthetic
-   test against a naive reference line at −110, and that line is nearly constant
-   (std 1.8 games against an actual std of 7.2), so its large positive ROI
-   reflects the baseline's weakness, not profitability. It is labelled as such
-   everywhere it appears.
+1. **Totals and handicap lines on games exist only in the tennisexplorer
+   backfill**, and nowhere in tennis-data.co.uk or checkbestodds. Until that
+   scrape landed, two of the three models had never been scored against a
+   market at all, and the totals/spread "ROI" in the report was a *synthetic*
+   test against a naive reference line at −110 — a line so nearly constant
+   (std 1.8 games against an actual 7.2) that its large positive ROI reflects
+   the baseline's weakness rather than profitability. That synthetic figure is
+   still labelled as such everywhere it appears; the real comparison is now in
+   `scripts/totals_vs_market.py`.
 2. **`ongoing_tourneys.csv` contains only completed matches** — zero rows without
    a score or winner. It cannot supply a bracket before it is played, which
    settles the open question in CLAUDE.md. Past draws are reconstructed from our
@@ -294,6 +296,92 @@ favourite-longshot bias in place (measured here: favourites −5.4%, underdogs
 −11.5% against a 6.7% floor). That bias flows straight into the ensemble
 regression, which is a concrete argument for implementing Shin devigging before
 treating the non-replication as settled.
+
+**The models show real closing-line value — an order of magnitude short of
+profitable.** Placing one bet per match at Pinnacle's *opening* games line and
+scoring it against the close (`scripts/backtest_lines.py` and the CLV analysis
+alongside it):
+
+| market | bets | mean CLV | 95% CI | beat the close | z |
+|---|---|---|---|---|---|
+| totals | 12,917 | **+0.33 pts** | [+0.29, +0.37] | 52.9% | +6.6 |
+| spread | 14,979 | **+1.11 pts** | [+1.05, +1.17] | 60.6% | +25.9 |
+
+CLV is the right success metric because it scores every bet rather than only
+the ones that won, and it is what the market itself later agrees with. Both are
+overwhelmingly significant, both CIs exclude zero by a wide margin, and CLV
+*rises* with the edge threshold (totals: +0.298 at edge 0, +0.331 at 2%, +0.359
+at 5%), which is what signal looks like and noise does not.
+
+It is still not enough. The vig on those same lines is **3.5-3.8 points**, so
+totals covers about a tenth of what it needs and spread about a third. The ROI
+figures agree: against Pinnacle's tighter 4.0% margin, totals runs -1.79% to
+-0.24% and spread -0.55% to +0.63%, with every confidence interval spanning
+zero. Against the cross-book average at 7.3% vig both are clearly negative
+(-2.8% and -4.3%), though still well ahead of backing every over (-8.9%) or
+every under (-6.4%), so the model is extracting real value from the ladder --
+just less than the house charges to play.
+
+Two practical notes. Betting **every** positive-EV rung rather than the single
+best one costs about two points (totals -4.74% against -2.77%), because a ladder
+is a menu, not a dozen independent bets; for the same reason every interval here
+is bootstrapped **by match**, since rungs on one match settle on one scoreline.
+And some of the CLV may be timing rather than modelling: our features are
+as-of-match while an opening line can be days old, so part of what looks like
+foresight is simply more recent information.
+
+**Totals and spread, measured against a market for the first time.** On
+29,158 matches (2023–2026) with residual distributions fitted only on earlier
+seasons, the market wins both — but by less than the framing "MAE 5.17 games"
+suggests, and by almost exactly the margin the winner model concedes:
+
+| market | n (match-lines) | model | market | gap |
+|---|---|---|---|---|
+| totals (games) | 370,452 | 0.66050 | 0.65000 | **+0.0105** |
+| — Challenger | 199,113 | 0.66498 | 0.66124 | **+0.0037** |
+| — main tour | 171,339 | 0.65530 | 0.63693 | +0.0184 |
+| spread (games) | 345,843 | 0.64847 | 0.63297 | **+0.0155** |
+| — Challenger | 197,943 | 0.66911 | 0.65363 | +0.0155 |
+| — main tour | 147,900 | 0.62085 | 0.60533 | +0.0155 |
+
+For scale the winner model concedes 0.0135 to Pinnacle, so all three models sit
+a comparable distance behind their own market. The Challenger totals gap of
+0.0037 is the smallest of any comparison in this project, and it is the third
+independent market on which the Challenger-versus-main-tour pattern has shown
+up.
+
+Getting there needed two orientation traps fixed, both worth knowing about
+before touching `odds_quotes`. The k1/k2 columns are **winner-first** (99.8% of
+resolved matches), while the handicap `line` is quoted against a *pre-match*
+ordering, so the two agree only 51% of the time — pooled, that cancelled the
+signal to a correlation of +0.09 and a market that scored worse than a coin
+flip. The ladder's own direction identifies whose frame the line is in, which
+needs no re-parse and lifted the correlation to +0.43; moving from the
+winner's frame into the backtest's hash-chosen p1 removed the remaining
+12-point level bias (market 0.500, actual 0.501). Totals need neither fix,
+which is why that half worked immediately: over/under has no player
+orientation.
+
+**Shin devigging is now the default, and it did not change any conclusion.**
+Proportional devigging assumes the margin is split evenly between the two
+sides; books load it onto the longshot, so proportional over-states underdogs.
+`tennis/models/devig.py` implements Shin and power alongside it, and the choice
+was made on outcomes rather than literature: scored against realised results on
+**523,879 quotes across 18 books**, Shin beat proportional in **16 of 17**, and
+its advantage tracks how much margin a book charges (**r = 0.72, p = 0.001**).
+The single exception is Betfair — an exchange, with no bookmaker margin to
+misallocate, which is the control the theory would ask for.
+
+The effect is real but small: Pinnacle's market log loss moves 0.57364 →
+0.57349. It was adopted because it is the *benchmark* every model-vs-market
+comparison is measured against, so a bias there biases all of them.
+
+It was also expected to matter for one specific open question — whether the
+favourite-longshot bias was what made the Challenger softness fail to replicate
+on 2026 prices. It was not. Re-running that comparison under both methods moves
+the z-scores by **at most 0.2** (checkbestodds Challenger 4.2 → 4.0;
+tennisexplorer Challenger 0.5 → 0.5). The non-replication stands on its own and
+the devigging confound is closed rather than resolved in our favour.
 
 **Challenger lines are measurably softer — and still not beatable.** The
 biggest gap in the data was that tennis-data.co.uk prices zero Challenger
