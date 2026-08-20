@@ -80,6 +80,54 @@ def exclusive_write(what: str = "", *, wait: float = 300.0, poll: float = 2.0):
         CLAIM.unlink(missing_ok=True)
 
 
+class AlreadyRunning(RuntimeError):
+    """Raised when a job that must be a singleton is already running."""
+
+
+@contextlib.contextmanager
+def single_instance(name: str):
+    """Refuse to start if another live process is already running this job.
+
+    Distinct from `exclusive_write`, which coordinates *different* jobs that
+    both need the database. This stops the *same* job running twice, which the
+    scraper has no defence against on its own: every write it makes is
+    idempotent by primary key, so a second copy corrupts nothing, it just
+    silently re-fetches pages the first copy is already fetching and doubles
+    the request rate against a site we are deliberately rate-limiting. Two
+    `--details` runs overlapped for nine hours before anyone noticed.
+
+    The pid file is cleared if the process that wrote it is gone, so a crash
+    does not lock the job out permanently. There is no staleness timeout here
+    on purpose: unlike a write claim, a backfill legitimately runs for days.
+    """
+    pf = DATA / f".running-{name}"
+    try:
+        c = json.loads(pf.read_text())
+        if _alive(c.get("pid", -1)):
+            raise AlreadyRunning(
+                f"{name} is already running as pid {c['pid']} "
+                f"(started {c.get('since', 'unknown')}). "
+                f"Stop it first, or wait for it to finish."
+            )
+        log.info("clearing pid file for dead %s (pid %s)", name, c.get("pid"))
+    except (FileNotFoundError, ValueError):
+        pass
+    pf.parent.mkdir(parents=True, exist_ok=True)
+    pf.write_text(json.dumps({
+        "pid": os.getpid(), "name": name,
+        "since": datetime.now(timezone.utc).isoformat(timespec="seconds")}))
+    try:
+        yield
+    finally:
+        # Only clear our own pid file; a race that let two through must not
+        # have the loser delete the winner's claim on its way out.
+        try:
+            if json.loads(pf.read_text()).get("pid") == os.getpid():
+                pf.unlink(missing_ok=True)
+        except (FileNotFoundError, ValueError):
+            pass
+
+
 def should_yield() -> dict | None:
     """Whether a short writer is waiting. Cheap enough to call every batch."""
     c = _active_claim()

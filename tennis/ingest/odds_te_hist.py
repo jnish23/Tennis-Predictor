@@ -49,7 +49,7 @@ import pandas as pd
 import requests
 
 from tennis.config import DATA
-from tennis.db.lock import wait_for_clear
+from tennis.db.lock import AlreadyRunning, single_instance, wait_for_clear
 from tennis.db.schema import connect
 
 log = logging.getLogger(__name__)
@@ -528,13 +528,23 @@ if __name__ == "__main__":
     elif a.status:
         for k, v in status().items():
             print(f"{k}: {v}")
-    elif a.days:
-        s, e = (datetime.strptime(x, "%Y-%m-%d").date() for x in a.days)
-        print(scrape_days(s, e))
-    elif a.details is not None:
-        tours = None if a.tour == "all" else tuple(
-            t.strip() for t in a.tour.split(",") if t.strip())
-        print(scrape_details(a.details or None, tours=tours,
-                             order="oldest" if a.oldest_first else "recent"))
+    elif a.days or a.details is not None:
+        # Both tiers fetch from the same site under one deliberate rate limit,
+        # so they share a single guard: a second scraper of *either* kind would
+        # double the request rate, not just duplicate work.
+        try:
+            with single_instance("te-scrape"):
+                if a.days:
+                    s, e = (datetime.strptime(x, "%Y-%m-%d").date()
+                            for x in a.days)
+                    print(scrape_days(s, e))
+                else:
+                    tours = None if a.tour == "all" else tuple(
+                        t.strip() for t in a.tour.split(",") if t.strip())
+                    print(scrape_details(
+                        a.details or None, tours=tours,
+                        order="oldest" if a.oldest_first else "recent"))
+        except AlreadyRunning as exc:
+            raise SystemExit(f"refusing to start: {exc}")
     else:
         ap.print_help()

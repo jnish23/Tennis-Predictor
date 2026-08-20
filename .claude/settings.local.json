@@ -98,7 +98,22 @@
       "Bash(../.venv/bin/python -)",
       "Bash(KILL_EXISTING=1 nohup bash scripts/run_dashboard.sh)",
       "Bash(nohup .venv/bin/streamlit run dashboard/app.py --server.port 8502 --server.headless true)",
-      "Bash(curl -s -o /dev/null -w \"dashboard %{http_code}\\\\n\" http://localhost:8502)"
+      "Bash(curl -s -o /dev/null -w \"dashboard %{http_code}\\\\n\" http://localhost:8502)",
+      "Bash(git push *)",
+      "Bash(git ls-remote *)",
+      "Bash(gh pr create --base main --title 'Score totals and spread against a real market; add a betting screen' --body ' *)",
+      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py::test_bracket_prices_only_decided_ties -q)",
+      "Bash(grep -v \"^$\")",
+      "Bash(.venv/bin/python -m pytest tests/ -q -k \"bracket or draw or bye or round or sheet or progression\")",
+      "Bash(ps -o pid,lstart,etime,time,command -p 38521 -p 47288)",
+      "Bash(ps -o pid,ppid,command -p 47288 -p 47308 -p 38521 -p 38539)",
+      "Bash(kill 47288)",
+      "Bash(ps -o pid,lstart,command -p 38521 -p 47288 -p 47308)",
+      "Bash(echo \"exit: $?\")",
+      "Bash(timeout 600 .venv/bin/python scripts/dedupe_odds_quotes.py --dry-run)",
+      "Bash(.venv/bin/python scripts/dedupe_odds_quotes.py --dry-run)",
+      "Bash(.venv/bin/python scripts/dedupe_odds_quotes.py)",
+      "Bash(ps -o pid,etime,command -p 38521)"
     ]
   }
 }

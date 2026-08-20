@@ -283,14 +283,26 @@ def parse_draw_sheet(payload: dict, *, first_round_only: bool = True) -> pd.Data
             continue
         p1 = (x.get("player1") or {})
         p2 = (x.get("player2") or {})
-        is_bye = (str(x.get("result", "")).lower() == "bye"
-                  or x.get("player2Id") == BYE_PLAYER_ID)
+        s1 = x.get("player1Id") == BYE_PLAYER_ID or p1.get("id") == BYE_PLAYER_ID
+        s2 = x.get("player2Id") == BYE_PLAYER_ID or p2.get("id") == BYE_PLAYER_ID
+        is_bye = str(x.get("result", "")).lower() == "bye" or s1 or s2
+        seed1 = x.get("seed1") or p1.get("seed")
+        seed2 = x.get("seed2") or p2.get("seed")
+        # The sentinel sits on whichever side the real player is not, and the
+        # feed uses *both* sides -- in Cincinnati's 96-draw, Zverev and Paul
+        # held player1 while Etcheverry and Vacherot held player2 with the
+        # sentinel above them. Reading p1 blindly kept "Unknown Player" as the
+        # bye holder and dropped the actual seed from the bracket: 16 of the 32
+        # seeds vanished from the draw entirely. Put the real player in p1.
+        if s1 and not s2:
+            p1, p2 = p2, p1
+            seed1, seed2 = seed2, seed1
         rows.append({
             "round_id": x.get("roundId"),
             "draw_pos": x.get("draw"),
             "p1_name": p1.get("name"), "p2_name": None if is_bye else p2.get("name"),
-            "seed1": x.get("seed1") or p1.get("seed"),
-            "seed2": None if is_bye else (x.get("seed2") or p2.get("seed")),
+            "seed1": seed1,
+            "seed2": None if is_bye else seed2,
             "is_bye": is_bye,
             "result": x.get("result") or None,
         })
