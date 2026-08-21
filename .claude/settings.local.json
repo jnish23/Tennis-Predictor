@@ -113,7 +113,11 @@
       "Bash(timeout 600 .venv/bin/python scripts/dedupe_odds_quotes.py --dry-run)",
       "Bash(.venv/bin/python scripts/dedupe_odds_quotes.py --dry-run)",
       "Bash(.venv/bin/python scripts/dedupe_odds_quotes.py)",
-      "Bash(ps -o pid,etime,command -p 38521)"
+      "Bash(ps -o pid,etime,command -p 38521)",
+      "Bash(.venv/bin/python scripts/backtest_books.py)",
+      "Bash(git fetch *)",
+      "Bash(gh pr create --base main --title 'Test the model against every book and against opening prices' --body ' *)",
+      "Bash(.venv/bin/python scripts/backtest_markov.py)"
     ]
   }
 }
