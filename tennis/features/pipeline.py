@@ -1,4 +1,14 @@
-"""Build (or incrementally extend) the feature table from the match table."""
+"""Build (or incrementally extend) the feature table from the match table.
+
+**One engine per tour, and separate artifacts.** The ATP and WTA never play
+each other, so every rating in here -- Elo, form, serve and return rates,
+opponent strength -- is meaningful only within its own tour. Running one engine
+over both would not corrupt player state, since the two ID namespaces are
+disjoint, but it would silently pool anything global the engine ever grows, and
+it leaves the two tours sharing one artifact that nothing downstream can
+separate. Splitting at the source is cheaper than auditing every statistic
+forever, and it gives the dashboard the per-tour files its selector needs.
+"""
 from __future__ import annotations
 
 import logging
@@ -12,12 +22,23 @@ from tennis.features.build import REQUIRED, FeatureEngine, build_features
 
 log = logging.getLogger(__name__)
 
-FEATURES_PATH = ARTIFACTS / "features.parquet"
-STATE_PATH = ARTIFACTS / "feature_state.pkl"
+def features_path(tour: str = "atp"):
+    return ARTIFACTS / f"features_{tour}.parquet"
+
+
+def state_path(tour: str = "atp"):
+    return ARTIFACTS / f"feature_state_{tour}.pkl"
+
+
+# Kept so the ATP research scripts keep resolving; new code should call
+# features_path(tour) rather than assume a tour.
+FEATURES_PATH = features_path("atp")
+STATE_PATH = state_path("atp")
 
 MATCH_SQL = """
 SELECT m.*, t.surface, t.level, t.is_challenger, t.indoor, t.draw_size
 FROM matches m JOIN tournaments t USING(tourney_key)
+WHERE m.tour = ?
 ORDER BY m.seq
 """
 
@@ -30,8 +51,10 @@ FROM matches
 """
 
 
-def load_matches(con) -> pd.DataFrame:
-    df = pd.read_sql(MATCH_SQL, con)
+def load_matches(con, tour: str = "atp") -> pd.DataFrame:
+    df = pd.read_sql(MATCH_SQL, con, params=(tour,))
+    if df.empty:
+        raise RuntimeError(f"no matches for tour {tour!r}")
     missing = [c for c in REQUIRED if c not in df.columns]
     if missing:
         raise RuntimeError(f"match frame missing columns: {missing}")
@@ -49,19 +72,20 @@ def _attach_labels(feats: pd.DataFrame, con) -> pd.DataFrame:
     return out
 
 
-def run(full: bool = True) -> dict:
+def run(full: bool = True, tour: str = "atp") -> dict:
     """Full rebuild, or incremental extension from the saved engine state."""
     t0 = time.time()
+    features_p, state_p = features_path(tour), state_path(tour)
     con = connect()
-    matches = load_matches(con)
+    matches = load_matches(con, tour)
 
     engine = None
     emit_from = -1
     prior = None
-    if not full and STATE_PATH.exists() and FEATURES_PATH.exists():
-        engine = FeatureEngine.load(STATE_PATH)
+    if not full and state_p.exists() and features_p.exists():
+        engine = FeatureEngine.load(state_p)
         emit_from = engine.last_seq
-        prior = pd.read_parquet(FEATURES_PATH)
+        prior = pd.read_parquet(features_p)
         # Replay only what the engine has not already folded in.
         matches = matches[matches["seq"] > engine.last_seq]
         log.info("incremental: %d new matches after seq %d", len(matches), emit_from)
@@ -76,21 +100,26 @@ def run(full: bool = True) -> dict:
         feats = pd.concat([prior, feats], ignore_index=True)
         feats = feats.drop_duplicates("match_id", keep="last")
     feats = feats.sort_values("seq").reset_index(drop=True)
-    feats.to_parquet(FEATURES_PATH, index=False)
-    engine.save(STATE_PATH)
+    feats["tour"] = tour
+    feats.to_parquet(features_p, index=False)
+    engine.save(state_p)
 
-    # Mirror Elo into the DB so the dashboard can read current ratings.
-    rows = engine.elo.to_rows(int(engine.last_seq))
-    con.execute("DELETE FROM elo_state")
+    # Mirror Elo into the DB so the dashboard can read current ratings. Scoped
+    # by tour: this clears only this tour's rows, so rebuilding one tour never
+    # wipes the other's ratings.
+    rows = [(pid, scope, rating, n, seq, tour)
+            for pid, scope, rating, n, seq in engine.elo.to_rows(int(engine.last_seq))]
+    con.execute("DELETE FROM elo_state WHERE tour = ?", (tour,))
     con.executemany(
-        "INSERT INTO elo_state(player_id,scope,rating,n_matches,last_seq) "
-        "VALUES(?,?,?,?,?)", rows,
+        "INSERT INTO elo_state(player_id,scope,rating,n_matches,last_seq,tour) "
+        "VALUES(?,?,?,?,?,?)", rows,
     )
-    set_state(con, "features_last_seq", int(engine.last_seq))
+    set_state(con, f"features_last_seq_{tour}", int(engine.last_seq))
     con.commit()
     con.close()
 
     return {
+        "tour": tour,
         "total_rows": len(feats),
         "n_features": feats.shape[1],
         "seconds": round(time.time() - t0, 1),
@@ -103,5 +132,8 @@ def run(full: bool = True) -> dict:
 if __name__ == "__main__":
     import sys
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    for k, v in run(full="--incremental" not in sys.argv).items():
-        print(f"{k}: {v}")
+    full = "--incremental" not in sys.argv
+    tours = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--tour=")]
+    for t in (tours or ["atp", "wta"]):
+        for k, v in run(full=full, tour=t).items():
+            print(f"{k}: {v}")

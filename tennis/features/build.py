@@ -434,14 +434,17 @@ class FeatureEngine:
             me.brk.append(min(1.0, breaks_made / o_svgms))
 
     # -- persistence -------------------------------------------------------
-    def save(self, path=None) -> None:
-        path = path or (ARTIFACTS / "feature_state.pkl")
+    # State is per tour, so the filename carries one. There is deliberately no
+    # tourless default: a single shared "feature_state.pkl" is exactly how one
+    # tour's ratings would end up answering for the other.
+    def save(self, path=None, tour: str = "atp") -> None:
+        path = path or (ARTIFACTS / f"feature_state_{tour}.pkl")
         with open(path, "wb") as fh:
             pickle.dump(self, fh, protocol=pickle.HIGHEST_PROTOCOL)
 
     @staticmethod
-    def load(path=None) -> "FeatureEngine":
-        path = path or (ARTIFACTS / "feature_state.pkl")
+    def load(path=None, tour: str = "atp") -> "FeatureEngine":
+        path = path or (ARTIFACTS / f"feature_state_{tour}.pkl")
         with open(path, "rb") as fh:
             return pickle.load(fh)
 

@@ -1587,3 +1587,54 @@ def test_has_stats_does_not_require_service_game_counts():
             "l_1stWon": None, "w_2ndWon": None, "l_2ndWon": None,
             "w_SvGms": 10, "l_SvGms": 10}
     assert clean(pd.DataFrame([bare])).iloc[0]["has_stats"] == 0
+
+
+@pytest.mark.needs_db
+def test_feature_state_is_scoped_per_tour():
+    """ATP and WTA must never share a rating pool.
+
+    They never play each other, so an Elo, a form window or a serve rate is
+    meaningful only inside its own tour. The two id namespaces happen to be
+    disjoint (WTA numeric, ATP alphanumeric), which would hide a pooling bug
+    rather than prevent one, so the split is made at the source and asserted
+    here instead of being left to that coincidence.
+    """
+    import pandas as pd
+
+    from tennis.features.pipeline import features_path
+
+    paths = {t: features_path(t) for t in ("atp", "wta")}
+    for t, p in paths.items():
+        if not p.exists():
+            pytest.skip(f"{p.name} not built")
+
+    frames = {t: pd.read_parquet(p) for t, p in paths.items()}
+    for t, f in frames.items():
+        assert set(f["tour"].unique()) == {t}, f"{t} features carry other tours"
+
+    ids = {t: set(f.p1_id) | set(f.p2_id) for t, f in frames.items()}
+    assert not (ids["atp"] & ids["wta"]), "a player appears on both tours"
+
+
+@pytest.mark.needs_db
+def test_tour_average_spw_differs_by_tour():
+    """The chain's anchor point is tour-specific, and materially so.
+
+    The ATP holds serve on ~62% of points and the WTA on ~56%. Because the
+    Markov chain amplifies away from this origin non-linearly, a pooled average
+    is not a harmless approximation -- it is wrong for both tours in the one
+    place every rating and probability is measured from.
+    """
+    from tennis.db.schema import connect
+    from tennis.models.markov import tour_average_spw
+
+    con = connect()
+    try:
+        atp = tour_average_spw(con, "atp")
+        wta = tour_average_spw(con, "wta")
+    finally:
+        con.close()
+    if not (0 < wta < 1) or not (0 < atp < 1):
+        pytest.skip("serve stats not loaded")
+    assert atp > wta + 0.03, f"expected a real gap, got atp={atp:.4f} wta={wta:.4f}"
+    assert 0.55 < atp < 0.70 and 0.50 < wta < 0.62

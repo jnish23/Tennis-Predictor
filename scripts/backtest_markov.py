@@ -55,7 +55,7 @@ def score(label: str, y: np.ndarray, p: np.ndarray, extra: dict | None = None):
     return row
 
 
-def build() -> pd.DataFrame:
+def build(tour: str = "atp") -> pd.DataFrame:
     """Backtest rows with a Markov probability from adjusted serve ratings.
 
     The raw rolling serve rate in `features.parquet` is deliberately *not*
@@ -65,15 +65,19 @@ def build() -> pd.DataFrame:
     """
     con = connect()
     con.execute("PRAGMA busy_timeout=60000")
-    avg = tour_average_spw(con)
+    # Both the ratings and the average they deviate from are per-tour. Feeding
+    # a mixed frame here would build one rating pool across two tours that
+    # never meet, anchored to an average belonging to neither.
+    avg = tour_average_spw(con, tour)
     m = pd.read_sql("""
         SELECT mm.match_id, mm.seq, mm.winner_id, mm.loser_id, mm.best_of,
                mm.w_svpt, mm.w_1stWon, mm.w_2ndWon,
                mm.l_svpt, mm.l_1stWon, mm.l_2ndWon, t.surface
         FROM matches mm JOIN tournaments t USING(tourney_key)
-        ORDER BY mm.seq""", con)
+        WHERE mm.tour = ?
+        ORDER BY mm.seq""", con, params=(tour,))
     con.close()
-    print(f"tour average serve points won: {avg:.4f}")
+    print(f"{tour}: tour average serve points won: {avg:.4f}")
 
     rat = SR.fit(m, avg)
     bt = load_backtest().merge(m[["match_id", "best_of"]], on="match_id",

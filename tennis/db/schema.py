@@ -212,6 +212,11 @@ CREATE TABLE IF NOT EXISTS elo_state (
     rating    REAL,
     n_matches INTEGER,
     last_seq  INTEGER,
+    -- Tour is not in the primary key: the ATP and WTA id namespaces are
+    -- disjoint, so it cannot disambiguate a row. It is here so a rebuild of
+    -- one tour can clear only its own ratings, and so the dashboard can show
+    -- one tour's ladder without the other's.
+    tour      TEXT,
     PRIMARY KEY (player_id, scope)
 );
 
@@ -317,7 +322,17 @@ def connect(path: Path | str = DB_PATH) -> sqlite3.Connection:
 # these ALTERs carry it to databases that already exist. Idempotent, and additive
 # by construction -- SQLite can only append a nullable column this way, so there
 # is no version counter to keep and no path that loses data.
-_ADDED_COLUMNS = (("odds_snapshots", "status", "TEXT"),)
+_ADDED_COLUMNS = (("odds_snapshots", "status", "TEXT"),
+                  ("elo_state", "tour", "TEXT"))
+
+# Run once, immediately after the matching column is added. A new column
+# arrives NULL on every existing row, and code that scopes by it then matches
+# nothing: the tour-scoped "DELETE FROM elo_state WHERE tour = 'atp'" cleared
+# no legacy rows and the rebuild collided with them on the primary key. Every
+# row that predates the column is ATP, because that was the only tour there
+# was.
+_BACKFILLS = (("elo_state", "tour",
+               "UPDATE elo_state SET tour = 'atp' WHERE tour IS NULL"),)
 
 
 def init_db(path: Path | str = DB_PATH) -> sqlite3.Connection:
@@ -327,6 +342,9 @@ def init_db(path: Path | str = DB_PATH) -> sqlite3.Connection:
         have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
         if col not in have:
             con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
+            for bt, bc, sql in _BACKFILLS:
+                if (bt, bc) == (table, col):
+                    con.execute(sql)
     con.commit()
     return con
 

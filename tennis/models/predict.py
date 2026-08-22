@@ -33,7 +33,8 @@ class MatchContext:
 
 class Predictor:
     def __init__(self, models=None, engine: FeatureEngine | None = None,
-                 players: pd.DataFrame | None = None, as_of: int | None = None):
+                 players: pd.DataFrame | None = None, as_of: int | None = None,
+                 tour: str = "atp"):
         """`as_of` (YYYYMMDD) caps rankings and ages to what was known then.
 
         Replaying a past tournament needs it: today's rankings already reflect
@@ -44,7 +45,8 @@ class Predictor:
             with open(ARTIFACTS / "models.pkl", "rb") as fh:
                 models = pickle.load(fh)
         self.m = models
-        self.engine = engine or FeatureEngine.load()
+        self.tour = tour
+        self.engine = engine or FeatureEngine.load(tour=tour)
         self.as_of = as_of
         if players is None:
             con = connect()
