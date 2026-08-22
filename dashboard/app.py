@@ -2034,7 +2034,15 @@ def page_betting() -> None:
         return
 
     c1, c2, c3 = st.columns(3)
-    edge = c1.slider("Minimum edge (EV)", 0.0, 0.25, 0.05, step=0.01)
+    # The floor is deliberately below zero. At 0.00 this filters to EV >= 0,
+    # which is not "no filter": with ~6.5% vig on these prices, a fixture where
+    # the model broadly agrees with the market has *both* sides negative and
+    # vanishes, so the page looked like it was dropping matches it had failed
+    # to price. Going negative shows every fixture and what the model thinks of
+    # it, which is the honest default use of this page anyway.
+    edge = c1.slider("Minimum edge (EV)", -0.10, 0.25, 0.05, step=0.01,
+                     help="Below 0 shows fixtures the model prices *worse* "
+                          "than the market — useful for inspection, never a bet.")
     cap = c2.slider("Kelly cap (fraction of bank)", 0.005, 0.05, 0.02, step=0.005)
     bank = c3.number_input("Bankroll", min_value=0.0, value=1000.0, step=100.0)
 
@@ -2074,6 +2082,7 @@ def page_betting() -> None:
             "EV %": round(max(ev1, ev2) * 100, 1),
             "_p": pm if side1 else 1 - pm,
             "_price": r.p1_odds if side1 else r.p2_odds,
+            "_other": r.p2_odds if side1 else r.p1_odds,
         })
     if not rows:
         st.warning("No fixtures could be priced.")
@@ -2089,12 +2098,22 @@ def page_betting() -> None:
              .drop(columns="_lvl"))
 
     st.subheader(f"{len(shown)} of {len(t)} fixtures clear a {edge:.0%} edge")
+    hidden = len(t) - len(shown)
+    if hidden:
+        vig = float(np.median(1 / t._price + 1 / t._other - 1)) * 100
+        st.caption(
+            f"{hidden} fixture(s) are priced but below the threshold — they are "
+            "not missing or unpriced. At a median vig of "
+            f"{vig:.1f}% a fixture where the model agrees with the market has a "
+            "negative EV on **both** sides, so it needs the slider below zero "
+            "to appear at all."
+        )
     if unresolved:
         st.caption(f"{unresolved} player name(s) did not resolve and were skipped.")
     if shown.empty:
         st.info("Nothing clears that threshold.")
     else:
-        show_table(shown.drop(columns=["_p", "_price"]))
+        show_table(shown.drop(columns=["_p", "_price", "_other"]))
         big = shown[shown["EV %"] >= 50]
         if len(big):
             st.warning(
