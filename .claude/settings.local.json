@@ -122,7 +122,17 @@
       "Bash(cd \"/Users/jordannishimura/Tennis Predictor\" && cat scripts/capture_odds.sh; echo \"--- log tail ---\"; tail -30 data/launchd-odds.log 2>/dev/null; echo \"--- symlink check ---\"; ls -la ~/Library/LaunchAgents/com.tennis.*.plist 2>/dev/null)",
       "Bash(cp \"/Users/jordannishimura/Tennis Predictor/deploy/launchd/com.tennis.odds.plist\" ~/Library/LaunchAgents/)",
       "Bash(launchctl load *)",
-      "Bash(plutil -p ~/Library/LaunchAgents/com.tennis.odds.plist)"
+      "Bash(plutil -p ~/Library/LaunchAgents/com.tennis.odds.plist)",
+      "Bash(awk '{print $6,$7,$8}')",
+      "Bash(.venv/bin/python -c \"import pyflakes; print\\('pyflakes', pyflakes.__version__\\)\")",
+      "Bash(.venv/bin/python -m ruff --version)",
+      "Bash(.venv/bin/python -m flake8 --version)",
+      "Bash(.venv/bin/python -m pyflakes tennis/ dashboard/ scripts/ tests/)",
+      "Bash(echo \"--- exit: $? ---\")",
+      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py -q -k \"undefined\")",
+      "Bash(.venv/bin/python -m tennis.ingest.daily)",
+      "Bash(awk '{print $6,$7,$8,$9}')",
+      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py::test_dedupe_fixtures_keys_on_the_pairing_not_the_date -q)"
     ]
   }
 }

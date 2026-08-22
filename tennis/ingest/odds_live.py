@@ -123,6 +123,7 @@ def parse(html: str, tour: str, day: date) -> pd.DataFrame:
                             "tour": tour, "tournament": tournament,
                             "p1_name": _clean(p1), "p2_name": _clean(p2),
                             "p1_odds": o1, "p2_odds": o2,
+                            "status": _status(r, nxt),
                         })
                 i += 2
                 continue
@@ -139,6 +140,29 @@ def _time(raw: str) -> str | None:
     """'14:30 Live streams 1xBet' -> '14:30'. The cell carries ad copy."""
     m = re.match(r"\s*(\d{1,2}:\d{2})", raw or "")
     return m.group(1) if m else None
+
+
+def _status(row, nxt) -> str:
+    """'finished' once the site marks a winner, else 'upcoming'.
+
+    The day page lists everything scheduled for that date regardless of whether
+    it has been played, and the capture agent runs through the day, so roughly
+    half of what it collects at any moment is already over. Without this the
+    betting screen quoted a Cincinnati match that had finished fourteen hours
+    earlier, at its pre-match price, indistinguishable from a live one.
+
+    The marker is the same `coursew` class `_prices` has to work around: the
+    site relabels the winner's price cell only once there is a winner. A score
+    cell is the corroborating signal, since an unplayed match has none.
+    """
+    for r in (row, nxt):
+        for td in r.find_all("td"):
+            if "coursew" in set(td.get("class") or []):
+                return "finished"
+    score = row.find("td", class_="result")
+    if score and score.get_text(strip=True):
+        return "finished"
+    return "upcoming"
 
 
 def _prices(row) -> tuple[float | None, float | None]:
@@ -184,7 +208,7 @@ def capture(day: date | None = None, tours=("atp", "wta")) -> dict:
 
     con = connect()
     cols = ["captured_at", "play_date", "start_time", "tour", "tournament",
-            "p1_name", "p2_name", "p1_odds", "p2_odds", "source"]
+            "p1_name", "p2_name", "p1_odds", "p2_odds", "source", "status"]
     con.executemany(
         f"INSERT OR REPLACE INTO odds_snapshots({','.join(cols)}) "
         f"VALUES ({','.join('?' * len(cols))})",

@@ -30,6 +30,7 @@ from tennis.config import (
     START_YEAR,
     SURFACE_MAP,
 )
+from tennis.db.lock import exclusive_write
 from tennis.db.schema import init_db, set_state
 from tennis.ingest.parse import parse_score
 

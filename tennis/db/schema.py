@@ -117,6 +117,11 @@ CREATE TABLE IF NOT EXISTS odds_snapshots (
     p1_odds     REAL,
     p2_odds     REAL,
     source      TEXT NOT NULL,   -- 'tennisexplorer'
+    -- 'upcoming' | 'finished' as of the moment of capture. The day page lists
+    -- everything scheduled for that date, played or not, so without this a
+    -- betting screen happily quotes a match that finished hours ago. NULL on
+    -- rows captured before this column existed.
+    status      TEXT,
     PRIMARY KEY (source, play_date, p1_name, p2_name, captured_at)
 );
 CREATE INDEX IF NOT EXISTS ix_snap_date ON odds_snapshots(play_date);
@@ -307,9 +312,21 @@ def connect(path: Path | str = DB_PATH) -> sqlite3.Connection:
     return con
 
 
+# Columns added after a table shipped. `CREATE TABLE IF NOT EXISTS` is a no-op
+# on an existing table, so a new column in SCHEMA reaches fresh installs only;
+# these ALTERs carry it to databases that already exist. Idempotent, and additive
+# by construction -- SQLite can only append a nullable column this way, so there
+# is no version counter to keep and no path that loses data.
+_ADDED_COLUMNS = (("odds_snapshots", "status", "TEXT"),)
+
+
 def init_db(path: Path | str = DB_PATH) -> sqlite3.Connection:
     con = connect(path)
     con.executescript(SCHEMA)
+    for table, col, decl in _ADDED_COLUMNS:
+        have = {r[1] for r in con.execute(f"PRAGMA table_info({table})")}
+        if col not in have:
+            con.execute(f"ALTER TABLE {table} ADD COLUMN {col} {decl}")
     con.commit()
     return con
 

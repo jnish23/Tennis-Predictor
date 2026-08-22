@@ -1292,7 +1292,8 @@ def test_dedupe_fixtures_keys_on_the_pairing_not_the_date():
 
     # app.py runs Streamlit calls at import, so pull the function out by source
     src = open("dashboard/app.py").read()
-    start = src.index("def dedupe_fixtures")
+    # From _pair_key, which dedupe_fixtures now shares with drop_finished.
+    start = src.index("def _pair_key")
     end = src.index("@st.cache_data", start)
     ns: dict = {"pd": pd}
     exec(src[start:end], ns)
@@ -1457,3 +1458,65 @@ def test_tourney_meta_trusts_a_challenger_name_over_the_history():
 
     order = ns["LEVEL_ORDER"]
     assert order["grand_slam"] < order["masters"] < order["atp250"] < order["challenger"]
+
+
+def test_no_undefined_names_anywhere():
+    """Catch the bug class that silently broke the nightly job for nine days.
+
+    A guard was added to `load_all` without importing it, so every run raised
+    `NameError: name 'exclusive_write' is not defined` -- after the download
+    step, so the logs looked busy and the failure was invisible until someone
+    asked why the data was stale. Nothing in the suite could catch it: the
+    function needs a database, and an import-time check does not evaluate
+    function bodies.
+
+    Only undefined names fail here. Unused imports are reported by pyflakes too
+    but are cosmetic, and failing on them would make this test noise that gets
+    disabled rather than a guard that gets trusted.
+    """
+    import subprocess
+    import sys
+
+    pyflakes = pytest.importorskip("pyflakes")     # noqa: F841
+    proc = subprocess.run(
+        [sys.executable, "-m", "pyflakes",
+         "tennis", "dashboard", "scripts", "tests"],
+        capture_output=True, text=True)
+    bad = [ln for ln in proc.stdout.splitlines() if "undefined name" in ln]
+    assert not bad, "undefined names:\n" + "\n".join(bad)
+
+
+def test_drop_finished_judges_the_fixture_not_the_row():
+    """A fixture seen finished once is finished, whatever other rows say.
+
+    Rows captured before the `status` column existed carry NULL. Treating NULL
+    as 'upcoming' row-by-row is what let played matches through: a finished
+    fixture still has its older NULL-status captures sitting in the table, and
+    those are precisely the rows a row-level filter keeps. Cincinnati's
+    Tiafoe-Musetti stayed on the betting screen at its pre-match price fourteen
+    hours after it ended.
+    """
+    import pandas as pd
+
+    src = open("dashboard/app.py").read()
+    start = src.index("def _pair_key")
+    end = src.index("def dedupe_fixtures", start)
+    ns: dict = {"pd": pd}
+    exec(src[start:end], ns)
+    drop_finished = ns["drop_finished"]
+
+    df = pd.DataFrame({
+        "p1_name": ["Tiafoe F.", "Musetti L.", "Fils A.", "Royer V."],
+        "p2_name": ["Musetti L.", "Tiafoe F.", "Cobolli F.", "Martinez P."],
+        # the older capture predates the column; the newer one knows
+        "status": [None, "finished", "upcoming", None],
+        "captured_at": ["2026-08-22T13:58", "2026-08-22T14:37",
+                        "2026-08-22T14:37", "2026-08-22T13:58"],
+    })
+    out = drop_finished(df)
+    # Both orientations of the finished fixture go, including the NULL row.
+    assert "Tiafoe F." not in set(out.p1_name) | set(out.p2_name)
+    # Genuinely upcoming fixtures survive, and so does an unknown-status one.
+    assert set(out.p1_name) == {"Fils A.", "Royer V."}
+    # No status column at all (an older database) must not blow up.
+    assert len(drop_finished(df.drop(columns="status"))) == 4

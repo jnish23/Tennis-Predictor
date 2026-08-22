@@ -1824,6 +1824,29 @@ def page_status() -> None:
         st.json(json.loads(p.read_text()))
 
 
+def _pair_key(df: pd.DataFrame) -> pd.Series:
+    """Order-insensitive fixture key: the site's p1/p2 order is not stable."""
+    pair = pd.DataFrame({"a": df.p1_name, "b": df.p2_name})
+    return pair.min(axis=1) + "|" + pair.max(axis=1)
+
+
+def drop_finished(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove fixtures any capture has seen finished.
+
+    Judged per *fixture*, not per row, and that distinction is the whole point.
+    Rows captured before the `status` column existed carry NULL, so a row-level
+    `COALESCE(status,'upcoming')` treats them as live -- and since those stale
+    rows are exactly the ones a finished match still has lying around, the
+    filter passed the very fixtures it was meant to remove. A Cincinnati match
+    that ended fourteen hours earlier stayed on the screen at its pre-match
+    price. If any capture of a fixture says finished, the fixture is finished.
+    """
+    if df.empty or "status" not in df.columns:
+        return df
+    done = set(_pair_key(df)[df.status.eq("finished")])
+    return df[~_pair_key(df).isin(done)]
+
+
 def dedupe_fixtures(df: pd.DataFrame) -> pd.DataFrame:
     """Latest priced capture per *pairing*, not per (pairing, date).
 
@@ -1835,8 +1858,7 @@ def dedupe_fixtures(df: pd.DataFrame) -> pd.DataFrame:
     """
     if df.empty:
         return df
-    pair = pd.DataFrame({"a": df.p1_name, "b": df.p2_name})
-    return (df.assign(_pair=pair.min(axis=1) + "|" + pair.max(axis=1))
+    return (df.assign(_pair=_pair_key(df))
               .sort_values("captured_at").drop_duplicates("_pair", keep="last")
               .drop(columns="_pair"))
 
@@ -1927,7 +1949,7 @@ def _upcoming(max_age_days: int = 3) -> pd.DataFrame:
         df = df.merge(meta, on="tournament", how="left")
     if df.empty:
         return df
-    df = dedupe_fixtures(df[df.p1_odds.notna() & df.p2_odds.notna()])
+    df = dedupe_fixtures(drop_finished(df[df.p1_odds.notna() & df.p2_odds.notna()]))
 
     from tennis.ingest.odds_live import surname_key
     # Most-recently-active player wins a key collision; two players can share a
@@ -1980,6 +2002,31 @@ def page_betting() -> None:
         st.caption(f"Latest capture {last_cap:%Y-%m-%d %H:%M} UTC "
                    f"({age_h:.1f}h ago).")
 
+    # A fresh price on a stale model is not a fresh prediction. The nightly job
+    # failed silently for nine days on an unimported name, and nothing on this
+    # page changed to say so -- the odds kept updating while every rating
+    # behind them aged. Surface how current the *results* are, next to how
+    # current the prices are.
+    try:
+        con = connect()
+        try:
+            last_match = con.execute(
+                "SELECT MAX(match_date) FROM matches").fetchone()[0]
+        finally:
+            con.close()
+        if last_match:
+            lm = pd.to_datetime(str(int(last_match)), format="%Y%m%d")
+            lag = (pd.Timestamp.now().normalize() - lm).days
+            msg = (f"Results loaded through **{lm:%Y-%m-%d}** ({lag}d ago); "
+                   "form, Elo and serve ratings are current to that date.")
+            (st.caption if lag <= 2 else st.warning)(
+                msg if lag <= 2 else
+                msg + " Anything played since is invisible to the model — run "
+                "`.venv/bin/python -m tennis.ingest.daily` or check "
+                "`data/launchd-daily.log`.")
+    except Exception:
+        pass
+
     unresolved = int(df.p1_id.isna().sum() + df.p2_id.isna().sum())
     d = df.dropna(subset=["p1_id", "p2_id"]).copy()
     if d.empty:
@@ -2014,6 +2061,8 @@ def page_betting() -> None:
         ev1, ev2 = pm * r.p1_odds - 1, (1 - pm) * r.p2_odds - 1
         side1 = ev1 >= ev2
         rows.append({
+            "Date": f"{str(r.play_date)[:4]}-{str(r.play_date)[4:6]}-"
+                    f"{str(r.play_date)[6:]}",
             "Tournament": r.tournament, "Time": r.start_time or "",
             "_lvl": LEVEL_ORDER.get(level, 99),
             "Level": LEVEL_LABEL.get(level, "—"),
@@ -2036,7 +2085,7 @@ def page_betting() -> None:
     # a schedule you can read down, rather than by EV, which scattered the same
     # tournament across the table and put the least trustworthy rows on top.
     shown = (t[t["EV %"] >= edge * 100]
-             .sort_values(["_lvl", "Tournament", "Time"])
+             .sort_values(["Date", "_lvl", "Tournament", "Time"])
              .drop(columns="_lvl"))
 
     st.subheader(f"{len(shown)} of {len(t)} fixtures clear a {edge:.0%} edge")
