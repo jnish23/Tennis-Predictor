@@ -1413,3 +1413,47 @@ def test_single_instance_refuses_a_second_live_run(tmp_path, monkeypatch):
     with lockmod.single_instance("job"):
         pass
     assert not pf.exists()
+
+
+def test_tourney_meta_trusts_a_challenger_name_over_the_history():
+    """Level resolution needs both sources, and in this order.
+
+    Events currently in play are often absent from `tournaments` entirely --
+    that table is built from *results*, so a tournament being played right now
+    has no row yet. A name carrying "challenger" states its own level and is
+    trusted outright. Matching by name alone also mis-resolves: "Cincinnati
+    WTA" normalises onto the ATP Cincinnati Masters row.
+    """
+    import sqlite3
+
+    import pandas as pd
+
+    src = open("dashboard/app.py").read()
+    start = src.index("LEVEL_ORDER = {")
+    end = src.index("# Short TTL", start)
+    ns: dict = {"pd": pd}
+    exec(src[start:end], ns)
+
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE tournaments (name TEXT, level TEXT, "
+                "surface TEXT, season INT)")
+    con.executemany("INSERT INTO tournaments VALUES (?,?,?,?)", [
+        ("Cincinnati Masters", "masters", "Hard", 2026),
+        ("Winston Salem", "atp250", "Hard", 2025),
+        ("Prague 2", "challenger", "Clay", 2024),
+    ])
+    out = ns["_tourney_meta"](pd.Series([
+        "Cincinnati", "Winston Salem", "Prague 2 challenger",
+        "Sion challenger",          # absent from history entirely
+    ]), con).set_index("tournament")
+
+    assert out.loc["Cincinnati", "level"] == "masters"
+    assert out.loc["Winston Salem", "level"] == "atp250"
+    # Present in history *and* named challenger -- surface still comes through.
+    assert out.loc["Prague 2 challenger", "level"] == "challenger"
+    assert out.loc["Prague 2 challenger", "surface"] == "Clay"
+    # Absent from history: the name still settles the level.
+    assert out.loc["Sion challenger", "level"] == "challenger"
+
+    order = ns["LEVEL_ORDER"]
+    assert order["grand_slam"] < order["masters"] < order["atp250"] < order["challenger"]

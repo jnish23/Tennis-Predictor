@@ -1841,13 +1841,72 @@ def dedupe_fixtures(df: pd.DataFrame) -> pd.DataFrame:
               .drop(columns="_pair"))
 
 
-@st.cache_data(show_spinner=False)
+# Highest tour level first. Anything unrecognised sorts last rather than
+# jumping the queue on a name we failed to resolve.
+LEVEL_ORDER = {"grand_slam": 0, "finals": 1, "masters": 2, "olympics": 3,
+               "atp500": 4, "atp250": 5, "davis_cup": 6, "challenger": 7}
+LEVEL_LABEL = {"grand_slam": "Grand Slam", "finals": "Finals",
+               "masters": "Masters", "olympics": "Olympics",
+               "atp500": "ATP 500", "atp250": "ATP 250",
+               "davis_cup": "Davis Cup", "challenger": "Challenger"}
+
+
+def _tourney_meta(names: pd.Series, con) -> pd.DataFrame:
+    """Resolve each fixture's tour level and surface from its event name.
+
+    Two sources, in this order, because neither alone is enough. A name
+    carrying "challenger" states its own level and is trusted outright -- the
+    events currently in play (Kingston, Quebec City, Roehampton, Sion) are too
+    new to appear in `tournaments` at all, since that table is built from
+    results. Everything else is matched by normalised name against the whole
+    history, levels being stable year to year.
+
+    Surface comes from the same lookup, and matters more than the ordering it
+    was added for: the predictions on this page were being made with surface
+    hardcoded to Hard, which silently mispriced every clay and grass event.
+    """
+    import re
+
+    def norm(s: str) -> str:
+        s = re.sub(r"\b(challenger|wta|atp|masters|open|itf)\b", "",
+                   (s or "").lower())
+        return " ".join(re.sub(r"[^a-z0-9 ]", " ", s).split())
+
+    hist = pd.read_sql("SELECT name, level, surface, season FROM tournaments", con)
+    hist["k"] = hist.name.map(norm)
+    hist = (hist.sort_values("season", ascending=False)
+                .drop_duplicates("k").set_index("k"))
+
+    rows = []
+    for n in names:
+        lo = (n or "").lower()
+        hit = hist.loc[norm(n)] if norm(n) in hist.index else None
+        if "challenger" in lo:
+            level = "challenger"          # the name is authoritative
+        else:
+            level = hit.level if hit is not None else None
+        rows.append({"tournament": n, "level": level,
+                     "surface": hit.surface if hit is not None else "Hard"})
+    return pd.DataFrame(rows).drop_duplicates("tournament")
+
+
+# Short TTL, not the default "cache forever". This page shows live prices and
+# the capture agent writes every three hours; without a TTL the dashboard
+# served the same frame for a week and the staleness banner reported the age of
+# the *cached* capture, so a freshly-run agent changed nothing on screen.
+@st.cache_data(ttl=300, show_spinner=False)
 def _upcoming(max_age_days: int = 3) -> pd.DataFrame:
     """Fixtures from the most recent live capture, with their moneyline.
 
     `odds_snapshots` holds one row per capture, so the latest capture per
     fixture is the freshest price we hold. Stale captures are surfaced rather
     than hidden -- a price from three days ago is not a price you can bet.
+
+    ATP only. The capture agent deliberately pulls both tours, but every model
+    here is trained on ATP matches, so a WTA fixture would be priced by a model
+    that has never seen those players -- and `surname_key` can quietly match a
+    WTA name onto an unrelated ATP player, which turns a meaningless number
+    into a confident-looking one.
     """
     con = connect()
     try:
@@ -1855,12 +1914,17 @@ def _upcoming(max_age_days: int = 3) -> pd.DataFrame:
         if last is None:
             return pd.DataFrame()
         df = pd.read_sql(
-            "SELECT * FROM odds_snapshots WHERE play_date >= ? ",
+            "SELECT * FROM odds_snapshots "
+            "WHERE play_date >= ? AND LOWER(COALESCE(tour,'atp')) = 'atp'",
             con, params=(int(last) - max_age_days,))
         players = pd.read_sql(
             "SELECT player_id, name, last_seen FROM players", con)
+        meta = _tourney_meta(df.tournament.dropna().unique(), con) \
+            if not df.empty else pd.DataFrame()
     finally:
         con.close()
+    if not df.empty and not meta.empty:
+        df = df.merge(meta, on="tournament", how="left")
     if df.empty:
         return df
     df = dedupe_fixtures(df[df.p1_odds.notna() & df.p2_odds.notna()])
@@ -1933,9 +1997,14 @@ def page_betting() -> None:
     pred = get_predictor()
     rows = []
     for r in d.itertuples():
-        ctx = MatchContext(surface="Hard", level="atp250", best_of=3,
-                           is_challenger=int("challenger" in
-                                             (r.tournament or "").lower()))
+        # Surface and level come from the event, not from a constant. They were
+        # pinned to Hard/atp250 here, which mispriced every clay and grass
+        # fixture on the page while looking entirely normal.
+        level = getattr(r, "level", None) or "atp250"
+        ctx = MatchContext(surface=getattr(r, "surface", None) or "Hard",
+                           level=level,
+                           best_of=5 if level == "grand_slam" else 3,
+                           is_challenger=int(level == "challenger"))
         try:
             pm = float(pred.predict_many([(r.p1_id, r.p2_id)], ctx)
                        .iloc[0]["p1_win_prob"])
@@ -1946,6 +2015,8 @@ def page_betting() -> None:
         side1 = ev1 >= ev2
         rows.append({
             "Tournament": r.tournament, "Time": r.start_time or "",
+            "_lvl": LEVEL_ORDER.get(level, 99),
+            "Level": LEVEL_LABEL.get(level, "—"),
             "Pick": r.p1_name if side1 else r.p2_name,
             "Against": r.p2_name if side1 else r.p1_name,
             "Price": r.p1_odds if side1 else r.p2_odds,
@@ -1961,7 +2032,12 @@ def page_betting() -> None:
 
     t = pd.DataFrame(rows)
     t["Stake"] = (_kelly(t._p.to_numpy(), t._price.to_numpy(), cap) * bank).round(2)
-    shown = t[t["EV %"] >= edge * 100].sort_values("EV %", ascending=False)
+    # Order by tour level (highest first), then the event, then start time --
+    # a schedule you can read down, rather than by EV, which scattered the same
+    # tournament across the table and put the least trustworthy rows on top.
+    shown = (t[t["EV %"] >= edge * 100]
+             .sort_values(["_lvl", "Tournament", "Time"])
+             .drop(columns="_lvl"))
 
     st.subheader(f"{len(shown)} of {len(t)} fixtures clear a {edge:.0%} edge")
     if unresolved:
