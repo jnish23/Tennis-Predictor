@@ -2100,7 +2100,7 @@ def page_betting() -> None:
     # a schedule you can read down, rather than by EV, which scattered the same
     # tournament across the table and put the least trustworthy rows on top.
     shown = (t[t["EV %"] >= edge * 100]
-             .sort_values(["Date", "_lvl", "Tournament", "Time"])
+             .sort_values(["_lvl", "Tournament", "Date", "Time"])
              .drop(columns="_lvl"))
 
     st.subheader(f"{len(shown)} of {len(t)} fixtures clear a {edge:.0%} edge")

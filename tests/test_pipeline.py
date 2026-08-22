@@ -1550,3 +1550,40 @@ def test_live_capture_fetches_tomorrow_as_well_as_today(monkeypatch):
 
     assert out == {"captured": 0}       # no crash on the empty parse
     assert asked == [("atp", date(2026, 8, 22)), ("atp", date(2026, 8, 23))]
+
+
+def test_has_stats_does_not_require_service_game_counts():
+    """Serve rates need point counters, not SvGms, and the WTA proves why.
+
+    The WTA files carry no service-game counts at all before 2015, while their
+    point counters run back to the early 2000s. Requiring SvGms marked 19,846
+    WTA matches as statless and switched the feature builder off for fifteen
+    seasons of otherwise complete data. Hold % and break % genuinely need
+    SvGms and are guarded where they are computed, not here.
+    """
+    import pandas as pd
+
+    from tennis.ingest.load import clean
+
+    base = {
+        "tourney_id": "2010-1", "tourney_name": "Test", "surface": "Hard",
+        "draw_size": 32, "tourney_level": "I", "indoor": "O",
+        "tourney_date": 20100503, "match_num": 1, "round": "R32",
+        "best_of": 3, "score": "6-4 6-4", "minutes": 90,
+        "winner_id": "W1", "loser_id": "L1",
+        "winner_name": "A B", "loser_name": "C D",
+        "is_challenger_file": 0, "tour": "wta", "source_file": "2010_wta.csv",
+    }
+    stats = {"w_svpt": 70, "l_svpt": 68, "w_1stWon": 30, "l_1stWon": 28,
+             "w_2ndWon": 12, "l_2ndWon": 11}
+    # A pre-2015 WTA row: full point counters, no service-game counts at all.
+    row = {**base, **stats, "w_SvGms": None, "l_SvGms": None}
+    out = clean(pd.DataFrame([row]))
+    assert len(out) == 1
+    assert out.iloc[0]["has_stats"] == 1, "point counters alone must qualify"
+
+    # Missing point counters must still disqualify it.
+    bare = {**base, "w_svpt": None, "l_svpt": None, "w_1stWon": None,
+            "l_1stWon": None, "w_2ndWon": None, "l_2ndWon": None,
+            "w_SvGms": 10, "l_SvGms": 10}
+    assert clean(pd.DataFrame([bare])).iloc[0]["has_stats"] == 0

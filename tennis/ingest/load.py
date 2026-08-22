@@ -60,7 +60,7 @@ def _slug(s: str) -> str:
 
 
 def read_raw(include_ongoing: bool = True) -> pd.DataFrame:
-    """Read every cached ATP CSV into one frame, tagged with its source."""
+    """Read every cached CSV into one frame, tagged with its source and tour."""
     frames = []
     for path in sorted(RAW_TML.glob("*.csv")):
         name = path.name
@@ -77,6 +77,10 @@ def read_raw(include_ongoing: bool = True) -> pd.DataFrame:
             continue
         df["source_file"] = name
         df["is_challenger_file"] = int("challenger" in name)
+        # Tour comes from the filename, the only place it is recorded. The two
+        # tours never meet, so every rating pool downstream must stay separate;
+        # mislabelling here would silently merge them.
+        df["tour"] = "wta" if "wta" in name else "atp"
         frames.append(df)
     if not frames:
         raise RuntimeError(f"no CSVs found in {RAW_TML}")
@@ -146,10 +150,19 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df.loc[df["status"] == "walkover", ["w_games", "l_games", "total_games",
                                         "total_sets", "game_margin"]] = 0
 
-    # A match "has stats" only when the serve counters are actually populated.
+    # A match "has stats" when the *point* counters are populated. SvGms is
+    # deliberately not required: the WTA files carry no service-game counts at
+    # all before 2015, while their point counters run back to the early 2000s
+    # at ~78%. Demanding SvGms discarded 19,846 WTA matches that have
+    # everything the serve and return rates actually need, and gated the
+    # feature builder off entirely for fifteen seasons. Measured against the
+    # ATP the change is a no-op -- 12 matches -- because there the two counters
+    # arrive together. Statistics that genuinely need SvGms (hold %, break %)
+    # are guarded separately where they are computed.
     df["has_stats"] = (
-        df[["w_svpt", "l_svpt", "w_SvGms", "l_SvGms"]].notna().all(axis=1)
-        & (df["w_svpt"].fillna(0) > 0)
+        df[["w_svpt", "l_svpt", "w_1stWon", "l_1stWon",
+            "w_2ndWon", "l_2ndWon"]].notna().all(axis=1)
+        & (df["w_svpt"].fillna(0) > 0) & (df["l_svpt"].fillna(0) > 0)
     ).astype(int)
 
     # ---- keys -------------------------------------------------------------
@@ -205,7 +218,6 @@ def clean(df: pd.DataFrame) -> pd.DataFrame:
     df["seq"] = np.arange(len(df), dtype="int64")
     # season follows the event's start date, now that tourney_date is the start
     df["season"] = df["tourney_date"] // 10000
-    df["tour"] = "atp"
     return df.drop(columns=["_edition"])
 
 
@@ -241,7 +253,7 @@ def build_players(df: pd.DataFrame) -> pd.DataFrame:
         cols = {f"{side}_id": "player_id", f"{side}_name": "name",
                 f"{side}_hand": "hand", f"{side}_ht": "height_cm",
                 f"{side}_ioc": "ioc"}
-        p = df[[*cols, "tourney_date"]].rename(columns=cols)
+        p = df[[*cols, "tourney_date", "tour"]].rename(columns=cols)
         parts.append(p)
     long = pd.concat(parts, ignore_index=True)
     long = long[long["player_id"].notna()]
@@ -258,9 +270,11 @@ def build_players(df: pd.DataFrame) -> pd.DataFrame:
         first_seen=("tourney_date", "min"),
         last_seen=("tourney_date", "max"),
         n_matches=("player_id", "size"),
+        # A player belongs to exactly one tour here -- the two never meet, so
+        # the mode is the tour, not an approximation of it.
+        tour=("tour", _mode),
     ).reset_index()
     out["name_norm"] = out["name"].map(norm_name)
-    out["tour"] = "atp"
     return out
 
 
@@ -279,7 +293,8 @@ def build_tournaments(df: pd.DataFrame) -> pd.DataFrame:
         draw_size=("draw_size", "max"),
         tourney_date=("tourney_date", "min"),
         season=("season", "min"),
-    ).reset_index().assign(tour="atp")
+        tour=("tour", _mode),
+    ).reset_index()
 
 
 MATCH_COLS = [

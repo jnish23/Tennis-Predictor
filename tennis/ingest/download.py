@@ -52,16 +52,17 @@ def list_remote_files() -> list[dict]:
     return json.loads(_get(TML_API))["files"]
 
 
-def _atp_targets(files: list[dict]) -> list[dict]:
-    """Main-tour + challenger yearly files from START_YEAR on, plus ongoing.
+def _targets(files: list[dict]) -> list[dict]:
+    """Yearly ATP main-tour, ATP challenger and WTA files, plus the ongoing ones.
 
-    WTA and qualifying files are listed upstream but are out of scope; the
-    loader is tour-agnostic so adding them later is a filter change here.
+    Qualifying files are listed upstream and remain out of scope. WTA carries
+    the identical 50-column schema, so this stays a filter rather than a
+    parallel code path.
     """
     out = []
     for f in files:
         name = f["name"]
-        m = re.fullmatch(r"(\d{4})(_challenger)?\.csv", name)
+        m = re.fullmatch(r"(\d{4})(_challenger|_wta)?\.csv", name)
         if m and int(m.group(1)) >= START_YEAR:
             out.append(f)
         elif name in ONGOING_FILES:
@@ -72,7 +73,7 @@ def _atp_targets(files: list[dict]) -> list[dict]:
 def sync_tennismylife(*, force: bool = False, ongoing_only: bool = False) -> list[Path]:
     """Download any file whose upstream mtime/size differs from our cache."""
     manifest = json.loads(MANIFEST.read_text()) if MANIFEST.exists() else {}
-    files = _atp_targets(list_remote_files())
+    files = _targets(list_remote_files())
     if ongoing_only:
         files = [f for f in files if f["name"] in ONGOING_FILES]
 

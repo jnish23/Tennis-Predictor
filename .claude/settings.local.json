@@ -132,7 +132,9 @@
       "Bash(.venv/bin/python -m pytest tests/test_pipeline.py -q -k \"undefined\")",
       "Bash(.venv/bin/python -m tennis.ingest.daily)",
       "Bash(awk '{print $6,$7,$8,$9}')",
-      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py::test_dedupe_fixtures_keys_on_the_pairing_not_the_date -q)"
+      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py::test_dedupe_fixtures_keys_on_the_pairing_not_the_date -q)",
+      "Bash(curl -s \"https://stats.tennismylife.org/api/data-files\")",
+      "Bash(.venv/bin/python -m pyflakes tennis/)"
     ]
   }
 }
