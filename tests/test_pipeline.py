@@ -1520,3 +1520,33 @@ def test_drop_finished_judges_the_fixture_not_the_row():
     assert set(out.p1_name) == {"Fils A.", "Royer V."}
     # No status column at all (an older database) must not blow up.
     assert len(drop_finished(df.drop(columns="status"))) == 4
+
+
+def test_live_capture_fetches_tomorrow_as_well_as_today(monkeypatch):
+    """A night session past midnight is filed under the next day's page.
+
+    Cincinnati's semi-finals split across two pages: Cobolli-Fils at 19:30 on
+    the day's page, Nakashima-Tiafoe at 00:00 on the following one. Fetching
+    only today missed the second entirely, and would have gone on missing it
+    until the day it started.
+
+    Also pins the empty-page path: an unparseable or simply empty page yields a
+    frame with *no columns*, so touching df.p1_odds raises AttributeError
+    instead of returning zero. Tomorrow's page is routinely empty out of
+    season, which would have turned a quiet no-op into a crashing agent.
+    """
+    from datetime import date
+
+    from tennis.ingest import odds_live
+
+    asked = []
+
+    def fake_fetch(tour, day):
+        asked.append((tour, day))
+        return "<html></html>"          # parses to zero rows, no columns
+
+    monkeypatch.setattr(odds_live, "fetch", fake_fetch)
+    out = odds_live.capture(day=date(2026, 8, 22), tours=("atp",))
+
+    assert out == {"captured": 0}       # no crash on the empty parse
+    assert asked == [("atp", date(2026, 8, 22)), ("atp", date(2026, 8, 23))]

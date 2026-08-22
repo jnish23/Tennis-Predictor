@@ -1935,10 +1935,16 @@ def _upcoming(max_age_days: int = 3) -> pd.DataFrame:
         last = con.execute("SELECT MAX(play_date) FROM odds_snapshots").fetchone()[0]
         if last is None:
             return pd.DataFrame()
+        # Real date arithmetic, not integer subtraction on YYYYMMDD: on the
+        # first of a month `20260901 - 3` is 20260898, which sorts above every
+        # date in August and quietly drops the two days either side of the
+        # boundary -- the days most likely to hold live fixtures.
+        cutoff = int((pd.to_datetime(str(int(last)), format="%Y%m%d")
+                      - pd.Timedelta(days=max_age_days)).strftime("%Y%m%d"))
         df = pd.read_sql(
             "SELECT * FROM odds_snapshots "
             "WHERE play_date >= ? AND LOWER(COALESCE(tour,'atp')) = 'atp'",
-            con, params=(int(last) - max_age_days,))
+            con, params=(cutoff,))
         players = pd.read_sql(
             "SELECT player_id, name, last_seen FROM players", con)
         meta = _tourney_meta(df.tournament.dropna().unique(), con) \
