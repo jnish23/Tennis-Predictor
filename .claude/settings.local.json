@@ -140,7 +140,13 @@
       "Bash(.venv/bin/python -m pytest tests/test_pipeline.py::test_predictions_are_orientation_symmetric -q)",
       "Bash(grep -vE \"^\\\\s*$\")",
       "Bash(.venv/bin/python -m pytest tests/ -q -k \"tour_scoped or tour_average or feature_state\" -v)",
-      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py -v -k \"scoped or spw\")"
+      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py -v -k \"scoped or spw\")",
+      "Bash(.venv/bin/python -m pyflakes tennis/models/train.py)",
+      "Bash(cp models.pkl models_atp.pkl)",
+      "Bash(cp backtest.parquet backtest_atp.parquet)",
+      "Bash(.venv/bin/python -m tennis.models.train --tour=wta)",
+      "Bash(.venv/bin/python -u scripts/experiment_pooled_tour.py --tour=wta)",
+      "Bash(nohup .venv/bin/python -u scripts/experiment_pooled_tour.py --tour=atp)"
     ]
   }
 }

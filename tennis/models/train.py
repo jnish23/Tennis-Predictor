@@ -25,7 +25,7 @@ from sklearn.isotonic import IsotonicRegression
 
 from tennis.config import ARTIFACTS
 from tennis.db.schema import connect
-from tennis.features.pipeline import FEATURES_PATH
+from tennis.features.pipeline import features_path
 from tennis.models.common import (
     CATEGORICAL,
     FEATURE_COLS,
@@ -82,9 +82,16 @@ ABS_FEATURES = ["d_elo", "d_elo_surf", "d_rank", "d_log_rank", "d_serve_edge",
                 "d_spw", "d_rpw", "d_winrate_25", "d_h2h"]
 
 
-def load_features() -> pd.DataFrame:
-    df = pd.read_parquet(FEATURES_PATH)
-    return prepare(df)
+def load_features(tour: str = "atp") -> pd.DataFrame:
+    """One tour's features. Models are fitted per tour, never pooled by default.
+
+    The two tours are structurally different -- the ATP holds serve on 62.3% of
+    points against the WTA's 56.1% -- so the mapping from a serve edge to a
+    match probability differs, and pooling would let 201k ATP rows set the
+    shape for 72k WTA ones. `scripts/experiment_pooled_tour.py` measures that
+    rather than assuming it.
+    """
+    return prepare(pd.read_parquet(features_path(tour)))
 
 
 def add_abs(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -103,9 +110,11 @@ def _fit(params, X, y, feats, rounds=N_ROUNDS):
     return lgb.train(params, ds, num_boost_round=rounds)
 
 
-def run_backtest(start_season: int = 2010, run_tag: str = "wf_v1") -> dict:
+def run_backtest(start_season: int = 2010, run_tag: str | None = None,
+                 tour: str = "atp") -> dict:
     t0 = time.time()
-    df = load_features()
+    run_tag = run_tag or f"wf_{tour}"
+    df = load_features(tour)
     df, abs_cols = add_abs(df)
     win_feats = list(FEATURE_COLS)
     reg_feats = list(FEATURE_COLS) + abs_cols
@@ -161,7 +170,7 @@ def run_backtest(start_season: int = 2010, run_tag: str = "wf_v1") -> dict:
         log.info("  season %s: train=%d test=%d", season, len(tr), len(te))
 
     out = pd.concat(preds, ignore_index=True)
-    out.to_parquet(ARTIFACTS / "backtest.parquet", index=False)
+    out.to_parquet(ARTIFACTS / f"backtest_{tour}.parquet", index=False)
 
     con = connect()
     con.execute("DELETE FROM backtest WHERE run_tag=?", (run_tag,))
@@ -169,7 +178,7 @@ def run_backtest(start_season: int = 2010, run_tag: str = "wf_v1") -> dict:
             "is_challenger", "p1_id", "p2_id", "y_win", "p_win", "y_total",
             "pred_total", "y_spread", "pred_spread"]
     keep = out[cols].copy()
-    keep["tour"] = "atp"
+    keep["tour"] = tour
     keep["close_p1"] = np.nan
     keep["close_p2"] = np.nan
     keep.to_sql("backtest", con, if_exists="append", index=False)
@@ -202,9 +211,9 @@ def summarize(out: pd.DataFrame, t0: float | None = None) -> dict:
     return res
 
 
-def train_production_models() -> dict:
+def train_production_models(tour: str = "atp") -> dict:
     """Fit final models on all available history for live prediction."""
-    df = load_features()
+    df = load_features(tour)
     df, abs_cols = add_abs(df)
     win_feats = list(FEATURE_COLS)
     reg_feats = list(FEATURE_COLS) + abs_cols
@@ -222,29 +231,34 @@ def train_production_models() -> dict:
     m_spr = _fit(REG_PARAMS, trt, trt["y_spread"].to_numpy(), reg_feats)
 
     import pickle
-    with open(ARTIFACTS / "models.pkl", "wb") as fh:
+    with open(ARTIFACTS / f"models_{tour}.pkl", "wb") as fh:
         pickle.dump({
             "winner": m_win, "calibrator": iso, "totals": m_tot,
             "totals_sets": m_set, "spread": m_spr,
             "win_feats": win_feats, "reg_feats": reg_feats,
             "abs_features": ABS_FEATURES,
             "trained_through": int(df["tourney_date"].max()),
-            "n_train": len(df),
+            "n_train": len(df), "tour": tour,
         }, fh)
 
     imp = pd.DataFrame({
         "feature": m_win.feature_name(),
         "gain": m_win.feature_importance("gain"),
     }).sort_values("gain", ascending=False)
-    imp.to_csv(ARTIFACTS / "winner_feature_importance.csv", index=False)
-    return {"n_train": len(df), "top_features": imp.head(15).to_dict("records")}
+    imp.to_csv(ARTIFACTS / f"winner_feature_importance_{tour}.csv", index=False)
+    return {"tour": tour, "n_train": len(df),
+            "top_features": imp.head(15).to_dict("records")}
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    res = run_backtest()
-    print(json.dumps(res, indent=2, default=str))
-    prod = train_production_models()
-    print("\nproduction models trained on", prod["n_train"], "rows")
-    for r in prod["top_features"][:12]:
-        print(f"  {r['feature']:<28} {r['gain']:,.0f}")
+    import sys
+    tours = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--tour=")]
+    for t in (tours or ["atp"]):
+        print(f"===== {t} =====")
+        res = run_backtest(tour=t)
+        print(json.dumps(res, indent=2, default=str))
+        prod = train_production_models(tour=t)
+        print(f"\nproduction models ({t}) trained on", prod["n_train"], "rows")
+        for r in prod["top_features"][:12]:
+            print(f"  {r['feature']:<28} {r['gain']:,.0f}")
