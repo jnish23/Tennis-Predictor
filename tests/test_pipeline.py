@@ -499,9 +499,13 @@ def test_tourney_xref_prefers_the_right_event_not_the_biggest():
     con.execute("PRAGMA busy_timeout=60000")
     try:
         with exclusive_write("test_tourney_xref"):
+            # Scoped to the ATP. Loading the WTA made this name ambiguous:
+            # "Billie Jean King Cup qualifying round: Kazakhstan vs. Canada"
+            # also matches, and picking it would have the test resolve a feed
+            # id against a completely different event's players.
             canada = pd.read_sql(
                 "SELECT tourney_key, tourney_date FROM tournaments "
-                "WHERE season=2026 AND name LIKE '%Canada%'", con)
+                "WHERE season=2026 AND tour='atp' AND name LIKE '%Canada%'", con)
             if canada.empty:
                 pytest.skip("Canada Masters 2026 not loaded")
             key = canada.iloc[0]["tourney_key"]
