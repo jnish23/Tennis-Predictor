@@ -29,6 +29,11 @@ class MatchContext:
     draw_size: float = 32.0
     tourney_date: int = 20260803
     is_challenger: int = 0
+    # The production model is fitted across both tours with `tour` as a
+    # feature, so a prediction has to say which one it is for. Defaulting to
+    # ATP keeps every existing caller correct rather than silently asking a
+    # pooled model to guess.
+    tour: str = "atp"
 
 
 class Predictor:
@@ -42,7 +47,15 @@ class Predictor:
         outcome into the prediction.
         """
         if models is None:
-            with open(ARTIFACTS / "models.pkl", "rb") as fh:
+            # One fitted model across both tours, but each tour's *own* rating
+            # state. The split is deliberate: pooling the fit was measured to
+            # help (see scripts/experiment_pooled_tour.py) while pooling the
+            # ratings would be meaningless, since the tours never meet and an
+            # Elo is only defined within its own pool.
+            path = ARTIFACTS / "models_pooled.pkl"
+            if not path.exists():
+                path = ARTIFACTS / f"models_{tour}.pkl"
+            with open(path, "rb") as fh:
                 models = pickle.load(fh)
         self.m = models
         self.tour = tour
@@ -97,7 +110,7 @@ class Predictor:
             "seq": -1,
             "tourney_date": ctx.tourney_date,
             "winner_id": p1, "loser_id": p2,     # orientation forced below
-            "surface": ctx.surface, "level": ctx.level,
+            "surface": ctx.surface, "level": ctx.level, "tour": ctx.tour,
             "is_challenger": ctx.is_challenger, "best_of": ctx.best_of,
             "round_idx": ctx.round_idx, "draw_size": ctx.draw_size,
             "indoor": ctx.indoor,
@@ -110,7 +123,12 @@ class Predictor:
             "winner_seed": np.nan, "loser_seed": np.nan,
             "winner_hand": self._attr(p1, "hand"), "loser_hand": self._attr(p2, "hand"),
         }
-        return self.engine.features_for(synth, force_winner_first=True)
+        row = self.engine.features_for(synth, force_winner_first=True)
+        # The engine emits its own fixed column set and does not carry context
+        # through, but the pooled model reads `tour` as a feature -- so it has
+        # to be put back on the row explicitly, not assumed to survive.
+        row["tour"] = ctx.tour
+        return row
 
     # -- scoring ----------------------------------------------------------
     def _score(self, pairs: list[tuple[str, str]], ctx: MatchContext) -> dict:

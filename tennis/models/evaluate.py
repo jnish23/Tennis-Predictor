@@ -38,8 +38,20 @@ log = logging.getLogger(__name__)
 VIG_PRICE = 1.909091  # -110 in decimal odds
 
 
-def load_backtest() -> pd.DataFrame:
-    return pd.read_parquet(ARTIFACTS / "backtest.parquet")
+def load_backtest(tour: str = "atp") -> pd.DataFrame:
+    """Walk-forward predictions for one tour.
+
+    The production fit is pooled across both tours, but every evaluation here
+    is per tour: a blended ATP+WTA log loss describes no tour anyone can bet
+    into, and would move whenever the mix of the two changed.
+    """
+    p = ARTIFACTS / "backtest_pooled.parquet"
+    if not p.exists():
+        p = ARTIFACTS / f"backtest_{tour}.parquet"
+    df = pd.read_parquet(p)
+    if "tour" in df.columns:
+        df = df[df["tour"] == tour].reset_index(drop=True)
+    return df
 
 
 def attach_odds(bt: pd.DataFrame, book: str = "PS",
@@ -234,10 +246,10 @@ def breakout(bt: pd.DataFrame, by: str) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("n", ascending=False)
 
 
-def full_report(book: str = "PS") -> dict:
-    bt = load_backtest()
+def full_report(book: str = "PS", tour: str = "atp") -> dict:
+    bt = load_backtest(tour)
     bt["tour_level"] = np.where(bt["is_challenger"] == 1, "challenger", "main_tour")
-    bt["tour"] = "atp"  # WTA breakout activates when WTA data is loaded
+    bt["tour"] = tour
     withodds = attach_odds(bt, book=book)
 
     y, p = bt["y_win"].to_numpy(), bt["p_win"].to_numpy()
@@ -335,12 +347,18 @@ def full_report(book: str = "PS") -> dict:
     bt["season"] = bt["tourney_date"] // 10000
     rep["by_season"] = breakout(bt, "season").to_dict("records")
 
-    (ARTIFACTS / "backtest_report.json").write_text(json.dumps(rep, indent=2, default=str))
+    (ARTIFACTS / f"backtest_report_{tour}.json").write_text(
+        json.dumps(rep, indent=2, default=str))
     return rep
 
 
 if __name__ == "__main__":
+    import sys
     logging.basicConfig(level=logging.INFO)
-    r = full_report()
-    print(json.dumps({k: v for k, v in r.items()
-                      if k not in ("calibration", "by_season")}, indent=2, default=str))
+    tours = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--tour=")]
+    for t in (tours or ["atp", "wta"]):
+        print(f"===== {t} =====")
+        r = full_report(tour=t)
+        print(json.dumps({k: v for k, v in r.items()
+                          if k not in ("calibration", "by_season")},
+                         indent=2, default=str))

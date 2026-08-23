@@ -82,16 +82,33 @@ ABS_FEATURES = ["d_elo", "d_elo_surf", "d_rank", "d_log_rank", "d_serve_edge",
                 "d_spw", "d_rpw", "d_winrate_25", "d_h2h"]
 
 
-def load_features(tour: str = "atp") -> pd.DataFrame:
-    """One tour's features. Models are fitted per tour, never pooled by default.
+TOURS = ("atp", "wta")
 
-    The two tours are structurally different -- the ATP holds serve on 62.3% of
-    points against the WTA's 56.1% -- so the mapping from a serve edge to a
-    match probability differs, and pooling would let 201k ATP rows set the
-    shape for 72k WTA ones. `scripts/experiment_pooled_tour.py` measures that
-    rather than assuming it.
+
+def load_features(tour: str = "pooled") -> pd.DataFrame:
+    """Features for one tour, or both pooled with `tour` as a model feature.
+
+    Pooled is the default because it was measured to be better, not assumed.
+    A model trained on both tours and given the `tour` column beats a WTA-only
+    model by 0.0044 log loss (95% CI [-0.0057, -0.0031], 14 of 15 walk-forward
+    seasons) and costs the ATP nothing measurable. The tours are genuinely
+    different -- 62.3% of serve points won against 56.1% -- but that argues for
+    letting the model *see* the difference, not for hiding half the data from
+    it. Ratings feeding these features stay strictly per tour; only the fit is
+    shared. See scripts/experiment_pooled_tour.py.
+
+    Rows are returned in global chronological order, so the walk-forward split
+    below cuts both tours at the same instant rather than by position.
     """
-    return prepare(pd.read_parquet(features_path(tour)))
+    if tour != "pooled":
+        return prepare(pd.read_parquet(features_path(tour)))
+    frames = [pd.read_parquet(features_path(t)) for t in TOURS]
+    df = pd.concat(frames, ignore_index=True)
+    # `seq` is assigned per tour, so it cannot order a pooled frame; the date
+    # can. Sorting by seq here would interleave two tours' counters and put
+    # 2026 WTA matches before 2005 ATP ones.
+    df = df.sort_values(["tourney_date", "tour", "seq"]).reset_index(drop=True)
+    return prepare(df)
 
 
 def add_abs(df: pd.DataFrame) -> tuple[pd.DataFrame, list[str]]:
@@ -111,7 +128,7 @@ def _fit(params, X, y, feats, rounds=N_ROUNDS):
 
 
 def run_backtest(start_season: int = 2010, run_tag: str | None = None,
-                 tour: str = "atp") -> dict:
+                 tour: str = "pooled") -> dict:
     t0 = time.time()
     run_tag = run_tag or f"wf_{tour}"
     df = load_features(tour)
@@ -153,6 +170,9 @@ def run_backtest(start_season: int = 2010, run_tag: str | None = None,
             "season": season,
             "surface": te["surface"].astype(str).to_numpy(),
             "level": te["level"].astype(str).to_numpy(),
+            # Carried through so a pooled backtest can still be reported one
+            # tour at a time -- the fit is shared, the reporting is not.
+            "tour": te["tour"].astype(str).to_numpy(),
             "is_challenger": te["is_challenger"].to_numpy(),
             "p1_id": te["p1_id"].to_numpy(),
             "p2_id": te["p2_id"].to_numpy(),
@@ -176,9 +196,8 @@ def run_backtest(start_season: int = 2010, run_tag: str | None = None,
     con.execute("DELETE FROM backtest WHERE run_tag=?", (run_tag,))
     cols = ["run_tag", "match_id", "seq", "tourney_date", "surface", "level",
             "is_challenger", "p1_id", "p2_id", "y_win", "p_win", "y_total",
-            "pred_total", "y_spread", "pred_spread"]
+            "pred_total", "y_spread", "pred_spread", "tour"]
     keep = out[cols].copy()
-    keep["tour"] = tour
     keep["close_p1"] = np.nan
     keep["close_p2"] = np.nan
     keep.to_sql("backtest", con, if_exists="append", index=False)
@@ -211,7 +230,7 @@ def summarize(out: pd.DataFrame, t0: float | None = None) -> dict:
     return res
 
 
-def train_production_models(tour: str = "atp") -> dict:
+def train_production_models(tour: str = "pooled") -> dict:
     """Fit final models on all available history for live prediction."""
     df = load_features(tour)
     df, abs_cols = add_abs(df)
@@ -254,7 +273,7 @@ if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     import sys
     tours = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--tour=")]
-    for t in (tours or ["atp"]):
+    for t in (tours or ["pooled"]):
         print(f"===== {t} =====")
         res = run_backtest(tour=t)
         print(json.dumps(res, indent=2, default=str))

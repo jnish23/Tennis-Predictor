@@ -1638,3 +1638,47 @@ def test_tour_average_spw_differs_by_tour():
         pytest.skip("serve stats not loaded")
     assert atp > wta + 0.03, f"expected a real gap, got atp={atp:.4f} wta={wta:.4f}"
     assert 0.55 < atp < 0.70 and 0.50 < wta < 0.62
+
+
+def test_tour_is_a_model_feature_not_just_a_partition():
+    """The pooled fit needs `tour` as a real feature, and a categorical one.
+
+    Pooling without it would force one model to average over two tours that
+    hold serve at 62.3% and 56.1% -- a straw man that would lose to separate
+    models. With it, pooling beat a WTA-only fit by 0.0044 log loss across 14
+    of 15 walk-forward seasons and cost the ATP nothing.
+    """
+    from tennis.models.common import CATEGORICAL, FEATURE_COLS
+
+    assert "tour" in CATEGORICAL
+    assert "tour" in FEATURE_COLS
+
+
+def test_match_context_carries_a_tour():
+    """A prediction must state its tour, because the model asks for one."""
+    from tennis.models.predict import MatchContext
+
+    assert MatchContext().tour == "atp"
+    assert MatchContext(tour="wta").tour == "wta"
+
+
+@pytest.mark.needs_db
+def test_pooled_features_are_chronological_and_cover_both_tours():
+    """Pooled rows must be ordered by date, never by seq.
+
+    `seq` is assigned per tour, so it numbers two independent sequences. Sorting
+    a pooled frame by it interleaves those counters and would place 2026 WTA
+    matches before 2005 ATP ones -- which the walk-forward split would then
+    happily train on, leaking the future into every fold.
+    """
+    from tennis.features.pipeline import features_path
+    from tennis.models.train import load_features
+
+    for t in ("atp", "wta"):
+        if not features_path(t).exists():
+            pytest.skip(f"{t} features not built")
+
+    df = load_features("pooled")
+    assert set(df["tour"].unique()) == {"atp", "wta"}
+    dates = df["tourney_date"].to_numpy()
+    assert (dates[1:] >= dates[:-1]).all(), "pooled frame is not chronological"

@@ -104,24 +104,53 @@ st.markdown(
 
 
 # --------------------------------------------------------------------------
+# tour
+# --------------------------------------------------------------------------
+TOURS = {"ATP": "atp", "WTA": "wta"}
+
+
+def current_tour() -> str:
+    """The selected tour. One global choice, not a per-page filter.
+
+    Every page here is tour-specific -- a bracket, a rating ladder, a fixture
+    list, a backtest -- and the two tours never play each other, so there is no
+    view in which mixing them means anything. A single selector also keeps the
+    pages from disagreeing with one another.
+    """
+    return TOURS.get(st.session_state.get("tour_label", "ATP"), "atp")
+
+
+# --------------------------------------------------------------------------
 # cached loaders
 # --------------------------------------------------------------------------
 @st.cache_data(show_spinner=False)
-def load_players() -> pd.DataFrame:
+def load_players(tour: str = "atp") -> pd.DataFrame:
     con = connect()
     df = pd.read_sql(
         "SELECT player_id, name, hand, height_cm, ioc, n_matches, last_seen "
-        "FROM players ORDER BY n_matches DESC", con)
+        "FROM players WHERE tour = ? ORDER BY n_matches DESC", con, params=(tour,))
     con.close()
     return df
 
 
 @st.cache_data(show_spinner=False)
-def load_backtest() -> pd.DataFrame | None:
-    p = ARTIFACTS / "backtest.parquet"
+def load_backtest(tour: str = "atp") -> pd.DataFrame | None:
+    """Walk-forward predictions for one tour.
+
+    The fit is pooled but the reporting is not: a blended ATP+WTA accuracy
+    describes no tour anyone can bet on. Falls back to the per-tour backtest
+    if the pooled run has not been produced yet.
+    """
+    p = ARTIFACTS / "backtest_pooled.parquet"
+    if not p.exists():
+        p = ARTIFACTS / f"backtest_{tour}.parquet"
     if not p.exists():
         return None
     df = pd.read_parquet(p)
+    if "tour" in df.columns:
+        df = df[df["tour"] == tour]
+    if df.empty:
+        return None
     df["season"] = df["tourney_date"] // 10000
     df["tour_level"] = np.where(df["is_challenger"] == 1, "Challenger", "Main tour")
     # ~940 source rows carry no surface; label them rather than showing a blank row
@@ -130,8 +159,10 @@ def load_backtest() -> pd.DataFrame | None:
 
 
 @st.cache_data(show_spinner=False)
-def load_report() -> dict | None:
-    p = ARTIFACTS / "backtest_report.json"
+def load_report(tour: str = "atp") -> dict | None:
+    p = ARTIFACTS / f"backtest_report_{tour}.json"
+    if not p.exists():
+        p = ARTIFACTS / "backtest_report.json"
     return json.loads(p.read_text()) if p.exists() else None
 
 
@@ -139,7 +170,7 @@ ELO_SCOPES = ["overall", "Hard", "Clay", "Grass"]  # Carpet is retired
 
 
 @st.cache_data(show_spinner=False)
-def load_elo() -> pd.DataFrame:
+def load_elo(tour: str = "atp") -> pd.DataFrame:
     """One row per player, one column per surface rating.
 
     Surface columns carry the **blended** rating -- the number the model
@@ -154,10 +185,14 @@ def load_elo() -> pd.DataFrame:
     like-for-like comparison.
     """
     con = connect()
+    # Scoped by tour: the two ladders are separate pools that both start at
+    # 1500, so a combined ranking would compare numbers that were never
+    # measured against each other.
     df = pd.read_sql(
         "SELECT e.player_id, p.name, e.scope, e.rating, e.n_matches, p.last_seen "
         "FROM elo_state e JOIN players p USING(player_id) "
-        "WHERE e.scope IN ('overall','Hard','Clay','Grass')", con)
+        "WHERE e.scope IN ('overall','Hard','Clay','Grass') AND e.tour = ?",
+        con, params=(tour,))
     con.close()
     if df.empty:
         return df
@@ -286,13 +321,14 @@ def _ord(d: int) -> int:
 
 
 @st.cache_resource(show_spinner=False)
-def get_predictor():
+def get_predictor(tour: str = "atp"):
     from tennis.models.predict import Predictor
-    return Predictor()
+    return Predictor(tour=tour)
 
 
 def models_ready() -> bool:
-    return (ARTIFACTS / "models.pkl").exists()
+    return any((ARTIFACTS / n).exists() for n in
+               ("models_pooled.pkl", "models_atp.pkl", "models.pkl"))
 
 
 # --------------------------------------------------------------------------
@@ -308,7 +344,7 @@ def page_predictions() -> None:
         st.warning("No trained models found. Run `python -m tennis.models.train` first.")
         return
 
-    players = load_players()
+    players = load_players(current_tour())
     names = players["name"].dropna().tolist()
     name_to_id = dict(zip(players["name"], players["player_id"]))
 
@@ -335,7 +371,7 @@ def page_predictions() -> None:
             round_idx=float(ROUND_ORDER.index(rnd)),
             is_challenger=int(level == "challenger"),
         )
-        pred = get_predictor().predict_many([(name_to_id[p1], name_to_id[p2])], ctx)
+        pred = get_predictor(current_tour()).predict_many([(name_to_id[p1], name_to_id[p2])], ctx)
         r = pred.iloc[0]
 
         m1, m2, m3, m4 = st.columns(4)
@@ -361,11 +397,11 @@ def page_predictions() -> None:
 
 def page_backtest() -> None:
     st.header("Backtest performance")
-    bt = load_backtest()
+    bt = load_backtest(current_tour())
     if bt is None:
         st.warning("No backtest found. Run `python -m tennis.models.train`.")
         return
-    rep = load_report()
+    rep = load_report(current_tour())
 
     st.caption(
         f"Walk-forward, split strictly by date: each season is predicted by a "
@@ -462,7 +498,18 @@ def page_backtest() -> None:
         _hit_rate_explainer(rep)
 
         ms = rep.get("market_subset", {})
-        if ms:
+        # `n` rather than truthiness: the block is present but empty when no
+        # odds joined, and testing the dict alone walked straight into a
+        # KeyError on the WTA, where there are none to join.
+        if not ms.get("n"):
+            st.info(
+                "No market comparison for this tour. The historical odds feed "
+                "(tennis-data.co.uk) is ingested for the ATP only, so there is "
+                "nothing to price these matches against. The model metrics "
+                "above are unaffected — only the market benchmark and ROI "
+                "figures below need odds."
+            )
+        if ms.get("n"):
             cc = st.columns(3)
             cc[0].metric("Priced matches", f"{ms['n']:,}")
             cc[1].metric("Model log loss", f"{ms['model']['log_loss']:.4f}")
@@ -678,7 +725,7 @@ def _roi_by_season(rep: dict) -> None:
 
 def page_calibration() -> None:
     st.header("Calibration")
-    bt = load_backtest()
+    bt = load_backtest(current_tour())
     if bt is None:
         st.warning("No backtest found.")
         return
@@ -1263,9 +1310,9 @@ def _mode_replay(n_sims: int) -> None:
 
 
 @st.cache_data(ttl=1800, show_spinner="Finding live tournaments\u2026")
-def _live_tournaments(days: int) -> pd.DataFrame:
+def _live_tournaments(days: int, tour: str = "atp") -> pd.DataFrame:
     from tennis.ingest.draws_api import discover_tournaments
-    return discover_tournaments(days=days)
+    return discover_tournaments(days=days, tour=tour)
 
 
 # Which tier a level belongs to. History is only ever consulted to resolve an
@@ -1382,7 +1429,7 @@ def _mode_live(n_sims: int) -> None:
     from tennis.sim.draws import walk_bracket
 
     try:
-        live = _live_tournaments(LOOK_AHEAD_DAYS)
+        live = _live_tournaments(LOOK_AHEAD_DAYS, current_tour())
     except DrawFeedError as exc:
         st.error(str(exc))
         return
@@ -1500,7 +1547,7 @@ def _mode_live(n_sims: int) -> None:
         sheet = pd.DataFrame()
         full_sheet = pd.DataFrame()
         try:
-            payload = tournament_draw(slug, year)
+            payload = tournament_draw(slug, year, tour=current_tour())
             sheet = parse_draw_sheet(payload)
             full_sheet = parse_draw_sheet(payload, first_round_only=False)
         except DrawFeedError as exc:
@@ -1570,7 +1617,7 @@ def _mode_live(n_sims: int) -> None:
                         f"({chk['unknown']} not yet ingested).")
         else:
             try:
-                payload = tournament_fixtures(tid)
+                payload = tournament_fixtures(tid, tour=current_tour())
             except DrawFeedError as exc:
                 st.error(str(exc))
                 return
@@ -1613,7 +1660,7 @@ def _mode_live(n_sims: int) -> None:
             with st.spinner("Pre-tournament reference run\u2026"):
                 # Same model, same features, nothing pinned -- so every
                 # difference from the live run is caused by results alone.
-                compare = _sim(draw, get_predictor(), n_sims=n_sims)
+                compare = _sim(draw, get_predictor(current_tour()), n_sims=n_sims)
 
             # `standing` is who occupies each slot after the last fully
             # decided round -- i.e. actually still in. The union of every
@@ -1628,10 +1675,10 @@ def _mode_live(n_sims: int) -> None:
 
         from tennis.sim.bracket import bracket_state, simulate as _simulate
         with st.spinner("Building the bracket\u2026"):
-            rounds = bracket_state(draw, get_predictor(), live_resolved,
+            rounds = bracket_state(draw, get_predictor(current_tour()), live_resolved,
                                    scores=live_scores)
         with st.spinner(f"Running {n_sims:,} playthroughs\u2026"):
-            res = _simulate(draw, get_predictor(), n_sims=n_sims,
+            res = _simulate(draw, get_predictor(current_tour()), n_sims=n_sims,
                             resolved=live_resolved)
 
         # Everything the view needs, kept in session state. Widgets below
@@ -1655,7 +1702,7 @@ def _mode_live(n_sims: int) -> None:
             c[2].metric("Field", f"{s_['field']} entered")
             c[3].metric("Still alive", f"{s_['alive']}")
         _bracket_section(payload["draw"], payload["rounds"], key_prefix="live")
-        _render_sim(payload["draw"], get_predictor(), payload["n_sims"],
+        _render_sim(payload["draw"], get_predictor(current_tour()), payload["n_sims"],
                     key_prefix="live", resolved=payload["resolved"],
                     compare=payload["compare"], compare_label="Pre-tourn",
                     alive=payload.get("alive"),
@@ -1670,7 +1717,7 @@ def page_ratings() -> None:
         help="All-time is the career rating. Season to date shows how far that "
              "rating has moved since the season opened, plus this season's W-L.")
     season = basis != "All-time"
-    elo = load_elo()
+    elo = load_elo(current_tour())
     if elo.empty:
         st.warning("No Elo state. Run the feature pipeline.")
         return
@@ -1917,18 +1964,18 @@ def _tourney_meta(names: pd.Series, con) -> pd.DataFrame:
 # served the same frame for a week and the staleness banner reported the age of
 # the *cached* capture, so a freshly-run agent changed nothing on screen.
 @st.cache_data(ttl=300, show_spinner=False)
-def _upcoming(max_age_days: int = 3) -> pd.DataFrame:
+def _upcoming(max_age_days: int = 3, tour: str = "atp") -> pd.DataFrame:
     """Fixtures from the most recent live capture, with their moneyline.
 
     `odds_snapshots` holds one row per capture, so the latest capture per
     fixture is the freshest price we hold. Stale captures are surfaced rather
     than hidden -- a price from three days ago is not a price you can bet.
 
-    ATP only. The capture agent deliberately pulls both tours, but every model
-    here is trained on ATP matches, so a WTA fixture would be priced by a model
-    that has never seen those players -- and `surname_key` can quietly match a
-    WTA name onto an unrelated ATP player, which turns a meaningless number
-    into a confident-looking one.
+    Filtered to the selected tour, and the player lookup is filtered with it.
+    The capture agent pulls both tours into one table, so without the filter a
+    WTA entrant could resolve onto an ATP player sharing a surname and initial
+    -- which does not fail loudly, it produces a confident number built from
+    the wrong person's history.
     """
     con = connect()
     try:
@@ -1943,10 +1990,15 @@ def _upcoming(max_age_days: int = 3) -> pd.DataFrame:
                       - pd.Timedelta(days=max_age_days)).strftime("%Y%m%d"))
         df = pd.read_sql(
             "SELECT * FROM odds_snapshots "
-            "WHERE play_date >= ? AND LOWER(COALESCE(tour,'atp')) = 'atp'",
-            con, params=(cutoff,))
+            "WHERE play_date >= ? AND LOWER(COALESCE(tour,'atp')) = ?",
+            con, params=(cutoff, tour))
+        # Scoped to the same tour as the fixtures. Unscoped, a surname key
+        # can land a WTA entrant on an unrelated ATP player of the same name
+        # and initial, and the page would then price a real-looking matchup
+        # from the wrong person's history.
         players = pd.read_sql(
-            "SELECT player_id, name, last_seen FROM players", con)
+            "SELECT player_id, name, last_seen FROM players WHERE tour = ?",
+            con, params=(tour,))
         meta = _tourney_meta(df.tournament.dropna().unique(), con) \
             if not df.empty else pd.DataFrame()
     finally:
@@ -1988,7 +2040,7 @@ def page_betting() -> None:
         st.warning("No trained models found.")
         return
 
-    df = _upcoming()
+    df = _upcoming(tour=current_tour())
     if df.empty:
         st.info("No captured fixtures. Run `scripts/capture_odds.sh`.")
         return
@@ -2055,7 +2107,7 @@ def page_betting() -> None:
     from tennis.models.devig import shin
     from tennis.models.predict import MatchContext
 
-    pred = get_predictor()
+    pred = get_predictor(current_tour())
     rows = []
     for r in d.itertuples():
         # Surface and level come from the event, not from a constant. They were
@@ -2145,7 +2197,7 @@ def _betting_reality(edge: float) -> None:
     from the walk-forward backtest against real closing prices, and they are the
     better estimate of what the rows above will do.
     """
-    rep = load_report() or {}
+    rep = load_report(current_tour()) or {}
     roi = rep.get("roi_winner", {})
     if not roi:
         return
@@ -2185,7 +2237,17 @@ PAGES = {
     "Status": page_status,
 }
 
-st.sidebar.title("🎾 ATP model")
+st.sidebar.title("🎾 Tennis model")
+st.sidebar.radio("Tour", list(TOURS), key="tour_label", horizontal=True)
 choice = st.sidebar.radio("Page", list(PAGES))
-st.sidebar.caption("ATP main tour + Challenger, 2000–present. WTA deferred.")
+if current_tour() == "atp":
+    st.sidebar.caption("ATP main tour + Challenger, 2000–present.")
+else:
+    st.sidebar.caption(
+        "WTA main tour, 2000–present. No Challenger tier: the source "
+        "publishes none. Serve stats are thin before 2016.")
+st.sidebar.caption(
+    "One model fitted across both tours with `tour` as a feature — measured "
+    "better for the WTA than a WTA-only fit, and no worse for the ATP. "
+    "Ratings stay per tour.")
 PAGES[choice]()
