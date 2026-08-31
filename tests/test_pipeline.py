@@ -1686,3 +1686,100 @@ def test_pooled_features_are_chronological_and_cover_both_tours():
     assert set(df["tour"].unique()) == {"atp", "wta"}
     dates = df["tourney_date"].to_numpy()
     assert (dates[1:] >= dates[:-1]).all(), "pooled frame is not chronological"
+
+
+def test_seeded_positions_separate_the_top_seeds():
+    """The seeding order must keep the top seeds apart, round by round.
+
+    That separation is the entire point of a seeded draw: 1 and 2 cannot meet
+    before the final, the top four sit in four quarters, the top eight in eight
+    eighths.
+    """
+    from tennis.ingest.draws_api import seeded_positions
+
+    # Written the way a draw sheet is: 1 on the first line, 2 on the last.
+    assert seeded_positions(4) == [1, 4, 3, 2]
+    assert seeded_positions(64)[0] == 1 and seeded_positions(64)[-1] == 2
+    for n in (8, 16, 64):
+        order = seeded_positions(n)
+        assert sorted(order) == list(range(1, n + 1)), "not a permutation"
+        pos = {s: i for i, s in enumerate(order)}
+        for k in (2, 4, 8):
+            if k > n:
+                continue
+            sections = {pos[s] // (n // k) for s in range(1, k + 1)}
+            assert len(sections) == k, f"top {k} seeds share a section in a {n}-draw"
+
+
+def test_seed_ordering_fixes_the_bracket_without_touching_pairings():
+    """Reordering must rearrange ties, never repair or re-pair them.
+
+    The fixtures feed gives pairings in an arbitrary order, and the simulation
+    walks the bracket -- so that order decides every player's path. On the 2026
+    US Open feed it placed seeds 2 and 4 in the same quarter, a meeting that
+    cannot occur in any real draw.
+    """
+    import pandas as pd
+
+    from tennis.ingest.draws_api import order_fixtures_by_seed
+
+    # Eight ties, seeds deliberately in the wrong places.
+    fx = pd.DataFrame({
+        "p1_name": [f"Seed{i}" if i <= 4 else f"Player{i}" for i in range(1, 9)],
+        "p2_name": [f"Opp{i}" for i in range(1, 9)],
+        "seed1": [1, 2, 3, 4, None, None, None, None],
+        "seed2": [None] * 8,
+    })
+    out = order_fixtures_by_seed(fx)
+
+    assert len(out) == len(fx)
+    # Every tie survives intact -- same two players, still facing each other.
+    assert sorted(zip(fx.p1_name, fx.p2_name)) == sorted(zip(out.p1_name, out.p2_name))
+
+    pos = {int(r.seed1): i for i, r in enumerate(out.itertuples())
+           if pd.notna(r.seed1)}
+    assert pos[1] // 4 != pos[2] // 4, "seeds 1 and 2 must be in opposite halves"
+    assert len({pos[s] // 2 for s in (1, 2, 3, 4)}) == 4, "top 4 must be in 4 quarters"
+
+
+def test_seed_ordering_leaves_a_partial_draw_alone():
+    """A draw that is not a full power of two cannot be positioned meaningfully."""
+    import pandas as pd
+
+    from tennis.ingest.draws_api import order_fixtures_by_seed
+
+    fx = pd.DataFrame({"p1_name": ["a", "b", "c"], "p2_name": ["x", "y", "z"],
+                       "seed1": [1, None, None], "seed2": [None] * 3})
+    assert order_fixtures_by_seed(fx).equals(fx)
+    assert len(order_fixtures_by_seed(fx.iloc[:0])) == 0
+
+
+def test_tournament_draw_is_keyed_on_the_id_not_a_derived_slug():
+    """The draw lookup must use the numeric id, because a bad key is silent.
+
+    `tournament_slug` cut "National Bank Open - Montreal" down to "montreal",
+    which the endpoint matched, and "cincinnati" likewise -- so the approach
+    looked sound. "U.S. Open - New York" became "new-york", matched nothing,
+    and returned an empty sheet rather than an error. The page then fell back
+    to the fixtures feed, which carries pairings but no draw positions, and
+    rendered a confident bracket that disagreed with the official one.
+
+    Measured on the 2026 US Open: the id and the exact feed name each return
+    64 singles rows; "new-york", "us-open", "usopen", "flushing-meadows" and
+    "US Open" all return zero.
+    """
+    import inspect
+
+    from tennis.ingest import draws_api
+
+    sig = inspect.signature(draws_api.tournament_draw)
+    assert "key" in sig.parameters, "draw lookup should take a tournament key"
+
+    src = inspect.getsource(draws_api.tournament_draw)
+    assert "{key}" in src, "the request path must interpolate the key"
+
+    # The dashboard must pass the id through rather than re-deriving a slug.
+    app = open("dashboard/app.py").read()
+    assert "tournament_draw(draw_key" in app
+    assert "tournament_slug(str(row" not in app, \
+        "the draw key should no longer be derived from the tournament name"

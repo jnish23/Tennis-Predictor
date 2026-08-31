@@ -1527,11 +1527,14 @@ def _mode_live(n_sims: int) -> None:
         "Grand Slams)."
     )
 
-    slug_default = tournament_slug(str(row["name"]))
-    slug = st.text_input(
-        "Draw-sheet slug", slug_default,
-        help="The draw endpoint keys on a name slug rather than the numeric id. "
-             "Derived from the tournament name; override if the lookup fails.")
+    # The numeric id, not a derived slug. A slug that does not match returns an
+    # empty sheet rather than an error, so a bad guess showed up as a bracket
+    # built from the fixtures fallback -- right pairings, wrong positions --
+    # with nothing on screen to say the real draw had been missed.
+    draw_key = st.text_input(
+        "Draw-sheet key", str(row["tournament_id"]),
+        help="The tournament id the draw endpoint keys on. It also accepts a "
+             "tournament's exact feed name; override only if a lookup fails.")
 
     if st.button("Fetch draw & simulate", type="primary"):
         year = int(str(row["first_date"])[:4]) if row["first_date"] else None
@@ -1547,7 +1550,7 @@ def _mode_live(n_sims: int) -> None:
         sheet = pd.DataFrame()
         full_sheet = pd.DataFrame()
         try:
-            payload = tournament_draw(slug, year, tour=current_tour())
+            payload = tournament_draw(draw_key, year, tour=current_tour())
             sheet = parse_draw_sheet(payload)
             full_sheet = parse_draw_sheet(payload, first_round_only=False)
         except DrawFeedError as exc:
@@ -1640,10 +1643,20 @@ def _mode_live(n_sims: int) -> None:
             draw, unresolved = build_draw_from_fixtures(
                 r1, name=str(row["name"]), surface=surface, level=level,
                 best_of=best_of, indoor=ctx.get("indoor", 0.0))
-            st.caption(
-                "Bracket order follows the feed's order: correct for round-1 "
-                "pairings, but the arrangement of halves may differ from the "
-                "official sheet, so later-round matchups are indicative.")
+            st.info(
+                "**This is a reconstructed bracket, not the official sheet.** "
+                "The fixtures feed publishes pairings without draw positions, "
+                "so the ties are rearranged to put every seed where the seeding "
+                "rules place it — seeds 1 and 2 in opposite halves, the top "
+                "four in four quarters, and so on. Round-one pairings are the "
+                "feed's own and are exact.\n\n"
+                "What it cannot recover is which side of a band a seed drew: "
+                "seeds 3 and 4 genuinely could occupy either middle quarter, "
+                "and the official sheet settles that at random. So a specific "
+                "projected meeting may differ from the real draw even though "
+                "the structure is right. The draw sheet carries true positions "
+                "and takes over automatically once it is published — for a "
+                "Grand Slam that is typically around the start of play.")
 
         if unresolved:
             st.warning(

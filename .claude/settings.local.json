@@ -149,7 +149,10 @@
       "Bash(nohup .venv/bin/python -u scripts/experiment_pooled_tour.py --tour=atp)",
       "Bash(nohup .venv/bin/python -u -m tennis.models.train --tour=pooled)",
       "Bash(pkill -f \"until ! pgrep\")",
-      "Bash(.venv/bin/python -m tennis.models.evaluate)"
+      "Bash(.venv/bin/python -m tennis.models.evaluate)",
+      "Bash(.venv/bin/python -m pytest tests/test_pipeline.py -q -k \"seed\")",
+      "Bash(.venv/bin/python -m pyflakes tennis/ingest/draws_api.py)",
+      "Bash(.venv/bin/python -m pyflakes tennis/ dashboard/)"
     ]
   }
 }
