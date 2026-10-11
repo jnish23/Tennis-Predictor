@@ -122,6 +122,29 @@ class EloBook:
         self.counts[lk] = self.counts.get(lk, 0) + 1
         return rw, rl
 
+    def advance(self, pid: str, day: int | None) -> None:
+        """Realise the layoff decay owed to ALL of a player's ratings, then
+        restart the clock.
+
+        The clock is shared across scopes, so moving it forgets any decay still
+        owed to a scope that was not just updated: a player back from a long
+        layoff who plays on hard kept their full, stale clay rating. Decay is
+        therefore written into every stored rating first. Call before the
+        match's updates; they then see a zero-length gap.
+        """
+        if day is None:
+            return
+        seen = self.last_day.get(pid)
+        if seen is not None:
+            idle = (day - seen - IDLE_GRACE_DAYS) / 365.0
+            if idle > 0:
+                f = (1.0 - IDLE_DECAY) ** idle
+                for scope in ("overall", *SURFACES):
+                    key = self._key(pid, scope)
+                    if key in self.ratings:
+                        self.ratings[key] = BASE_RATING + (self.ratings[key] - BASE_RATING) * f
+        self.last_day[pid] = int(day)
+
     def touch(self, pid: str, day: int | None) -> None:
         """Mark a player as having played on `day`, stopping the layoff clock.
 

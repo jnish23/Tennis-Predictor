@@ -123,7 +123,13 @@ def current_tour() -> str:
 # --------------------------------------------------------------------------
 # cached loaders
 # --------------------------------------------------------------------------
-@st.cache_data(show_spinner=False)
+# The nightly job rewrites the database and artifacts under a long-running
+# server; a cache with no expiry kept serving the ratings and models of the day
+# it was first filled.
+CACHE_TTL = 3600
+
+
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_players(tour: str = "atp") -> pd.DataFrame:
     con = connect()
     df = pd.read_sql(
@@ -133,7 +139,7 @@ def load_players(tour: str = "atp") -> pd.DataFrame:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_backtest(tour: str = "atp") -> pd.DataFrame | None:
     """Walk-forward predictions for one tour.
 
@@ -158,18 +164,18 @@ def load_backtest(tour: str = "atp") -> pd.DataFrame | None:
     return df
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_report(tour: str = "atp") -> dict | None:
     p = ARTIFACTS / f"backtest_report_{tour}.json"
     if not p.exists():
-        p = ARTIFACTS / "backtest_report.json"
-    return json.loads(p.read_text()) if p.exists() else None
+        return None
+    return json.loads(p.read_text())
 
 
 ELO_SCOPES = ["overall", "Hard", "Clay", "Grass"]  # Carpet is retired
 
 
-@st.cache_data(show_spinner=False)
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
 def load_elo(tour: str = "atp") -> pd.DataFrame:
     """One row per player, one column per surface rating.
 
@@ -251,7 +257,7 @@ def season_label(start: int) -> int:
     return start // 10000 + 1
 
 
-@st.cache_data(show_spinner="Rebuilding ratings to the season opener…")
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Rebuilding ratings to the season opener…")
 def load_elo_season() -> pd.DataFrame:
     """Season-to-date *movement* of the all-time rating, plus season W-L.
 
@@ -320,7 +326,7 @@ def _ord(d: int) -> int:
     return pd.Timestamp(str(int(d))).toordinal()
 
 
-@st.cache_resource(show_spinner=False)
+@st.cache_resource(ttl=CACHE_TTL, max_entries=4, show_spinner=False)
 def get_predictor(tour: str = "atp"):
     from tennis.models.predict import Predictor
     return Predictor(tour=tour)
@@ -328,7 +334,7 @@ def get_predictor(tour: str = "atp"):
 
 def models_ready() -> bool:
     return any((ARTIFACTS / n).exists() for n in
-               ("models_pooled.pkl", "models_atp.pkl", "models.pkl"))
+               ("models_pooled.pkl", "models_atp.pkl"))
 
 
 # --------------------------------------------------------------------------
@@ -366,7 +372,7 @@ def page_predictions() -> None:
         from tennis.models.predict import MatchContext
         from tennis.config import ROUND_ORDER
         ctx = MatchContext(
-            surface=surface, level=level, best_of=best_of,
+            surface=surface, level=level, best_of=best_of, tour=current_tour(),
             indoor=1.0 if indoor else 0.0, round=rnd,
             round_idx=float(ROUND_ORDER.index(rnd)),
             is_challenger=int(level == "challenger"),
@@ -1153,22 +1159,28 @@ def _render_sim(draw, predictor, n_sims, actual=None, key_prefix="sim",
     return res
 
 
-@st.cache_data(show_spinner="Scanning past tournaments\u2026")
-def replayable_index(min_season: int) -> pd.DataFrame:
+@st.cache_data(ttl=CACHE_TTL, show_spinner="Scanning past tournaments\u2026")
+def replayable_index(min_season: int, tour: str = "atp") -> pd.DataFrame:
+    """Replayable events for ONE tour. Unfiltered, WTA events showed up on the
+    ATP page and every WTA player in them was an unknown to the ATP engine."""
     from tennis.sim.draws import list_replayable
     con = connect()
     try:
-        return list_replayable(con, min_season=min_season)
+        idx = list_replayable(con, min_season=min_season)
     finally:
         con.close()
+    return idx[idx["tour"] == tour].reset_index(drop=True) if len(idx) else idx
 
 
-@st.cache_resource(show_spinner="Rebuilding pre-tournament state\u2026")
-def predictor_as_of(seq: int, date: int):
+# Each entry is a full engine replayed from history, and every pick of a new
+# round or event adds one; unbounded, a long session grows without limit.
+@st.cache_resource(ttl=CACHE_TTL, max_entries=6,
+                   show_spinner="Rebuilding pre-tournament state\u2026")
+def predictor_as_of(seq: int, date: int, tour: str = "atp"):
     """Predictor whose knowledge stops before a given match sequence."""
     from tennis.models.predict import Predictor
     from tennis.sim.draws import engine_as_of
-    return Predictor(engine=engine_as_of(seq), as_of=date)
+    return Predictor(engine=engine_as_of(seq, tour), as_of=date, tour=tour)
 
 
 def page_simulation() -> None:
@@ -1201,7 +1213,7 @@ def _mode_replay(n_sims: int) -> None:
     )
     min_season = st.select_slider("From season", options=list(range(2010, 2027)),
                                   value=2022)
-    idx = replayable_index(min_season)
+    idx = replayable_index(min_season, current_tour())
     if idx.empty:
         st.warning("No reconstructable tournaments in that range.")
         return
@@ -1267,14 +1279,14 @@ def _mode_replay(n_sims: int) -> None:
         use_seq = pre_seq
         if from_round > 0 and feature_mode.startswith("Updated") and rep["state_seq"]:
             use_seq = int(rep["state_seq"])
-        pred = predictor_as_of(use_seq, date)
+        pred = predictor_as_of(use_seq, date, current_tour())
 
         # Unconditional pre-tournament run, shown as a reference column.
         compare = None
         if from_round > 0:
             from tennis.sim.bracket import simulate
             with st.spinner("Pre-tournament reference run\u2026"):
-                compare = simulate(draw, predictor_as_of(pre_seq, date),
+                compare = simulate(draw, predictor_as_of(pre_seq, date, current_tour()),
                                    n_sims=n_sims)
 
         from tennis.sim.bracket import bracket_state, simulate as _simulate
@@ -1302,7 +1314,8 @@ def _mode_replay(n_sims: int) -> None:
             f"state {'as of round ' + str(payload['from_round'] + 1) if payload['seq'] != payload['pre_seq'] else 'pre-tournament'}"
         )
         _bracket_section(payload["draw"], payload["rounds"], key_prefix="replay")
-        _render_sim(payload["draw"], predictor_as_of(payload["seq"], payload["date"]),
+        _render_sim(payload["draw"], predictor_as_of(payload["seq"], payload["date"],
+                                      current_tour()),
                     payload["n_sims"], actual=payload["actual"],
                     key_prefix="replay", resolved=payload["resolved"],
                     compare=payload["compare"], compare_label="Pre-tourn %",
@@ -1576,14 +1589,15 @@ def _mode_live(n_sims: int) -> None:
                 "The bracket below is the draw.")
             draw, unresolved = build_draw_from_sheet(
                 sheet, name=str(row["name"]), surface=surface, level=level,
-                best_of=best_of, indoor=ctx.get("indoor", 0.0))
+                best_of=best_of, indoor=ctx.get("indoor", 0.0),
+                tour=current_tour())
             st.caption(
                 "Bracket positions come from the draw sheet, so later-round "
                 "matchups are the real ones rather than an approximation.")
 
             # Pin matches already played, so a mid-event simulation does not
             # keep giving knocked-out players a chance of going deep.
-            res_df = played_results(full_sheet)
+            res_df = played_results(full_sheet, tour=current_tour())
             if not res_df.empty:
                 live_resolved, standing, done_rounds = walk_bracket(draw, res_df)
                 live_scores = {(r.winner_id, r.loser_id): r.score
@@ -1606,7 +1620,8 @@ def _mode_live(n_sims: int) -> None:
                     [x for x in draw.slots if x != "__BYE__"],
                     year or 0, row.get("first_date"))
                 chk = verify_winner_convention(
-                    full_sheet, event_matches(tkey) if tkey else pd.DataFrame())
+                    full_sheet, event_matches(tkey) if tkey else pd.DataFrame(),
+                    tour=current_tour())
                 if chk["contradicted"]:
                     st.error(
                         f"{chk['contradicted']} of {chk['checked']} completed "
@@ -1642,7 +1657,8 @@ def _mode_live(n_sims: int) -> None:
                 ["Player 1", "Seed 1", "Player 2", "Seed 2", "Date"]])
             draw, unresolved = build_draw_from_fixtures(
                 r1, name=str(row["name"]), surface=surface, level=level,
-                best_of=best_of, indoor=ctx.get("indoor", 0.0))
+                best_of=best_of, indoor=ctx.get("indoor", 0.0),
+                tour=current_tour())
             st.info(
                 "**This is a reconstructed bracket, not the official sheet.** "
                 "The fixtures feed publishes pairings without draw positions, "
@@ -2128,8 +2144,10 @@ def page_betting() -> None:
         # fixture on the page while looking entirely normal.
         level = getattr(r, "level", None) or "atp250"
         ctx = MatchContext(surface=getattr(r, "surface", None) or "Hard",
-                           level=level,
-                           best_of=5 if level == "grand_slam" else 3,
+                           level=level, tour=current_tour(),
+                           # Only the men play best-of-five, and only at Slams.
+                           best_of=(5 if level == "grand_slam"
+                                    and current_tour() == "atp" else 3),
                            is_challenger=int(level == "challenger"))
         try:
             pm = float(pred.predict_many([(r.p1_id, r.p2_id)], ctx)

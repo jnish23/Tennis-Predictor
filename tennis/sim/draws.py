@@ -40,7 +40,7 @@ TOURNEY_SQL = f"""
 SELECT m.tourney_key, m.round, m.round_idx, m.match_num, m.winner_id, m.loser_id,
        m.seq, m.status, m.score, m.best_of, m.total_games, m.game_margin, m.totals_usable,
        t.name, t.surface, t.level, t.indoor, t.draw_size, t.season, t.tourney_date,
-       t.is_challenger
+       t.is_challenger, t.tour
 FROM matches m JOIN tournaments t USING(tourney_key)
 WHERE t.level NOT IN {EXCLUDED_LEVELS}
   AND m.round NOT IN {EXCLUDED_ROUNDS}
@@ -124,6 +124,7 @@ def build_draw(con, tourney_key: str) -> tuple[Draw, pd.DataFrame] | None:
         draw_size=float(len(slots)),
         tourney_date=int(meta["tourney_date"]),
         is_challenger=int(meta["is_challenger"]),
+        tour=str(meta["tour"]),
     )
     draw = Draw(name=str(meta["name"]), slots=slots, ctx=ctx, player_names=names)
     return draw, g
@@ -140,6 +141,7 @@ def list_replayable(con, min_season: int = 2010, limit: int | None = None) -> pd
         m = sub.iloc[0]
         rows.append({
             "tourney_key": tk, "name": m["name"], "season": int(m["season"]),
+            "tour": str(m["tour"]),
             "tourney_date": int(m["tourney_date"]), "surface": m["surface"],
             "level": m["level"], "draw_size": len(slots),
             "n_players": len([s for s in slots if s != BYE]),
@@ -221,8 +223,12 @@ def calibration_of_replay(cmp: pd.DataFrame, bins: int = 10) -> pd.DataFrame:
 # --------------------------------------------------------------------------
 # pre-tournament feature state
 # --------------------------------------------------------------------------
-def engine_as_of(seq: int):
-    """FeatureEngine holding only what was known before match `seq`.
+def engine_as_of(seq: int, tour: str = "atp"):
+    """FeatureEngine holding only what was known before match `seq`, for `tour`.
+
+    The tour is required knowledge, not a detail: the engine's player ids and
+    ratings only exist within one tour, and defaulting a WTA replay to the ATP
+    engine made every WTA player an unknown.
 
     Replays history rather than reusing the live engine: the saved state has
     already absorbed the tournament we are about to simulate, and using it would
@@ -232,7 +238,7 @@ def engine_as_of(seq: int):
     from tennis.features.pipeline import load_matches
 
     con = connect()
-    m = load_matches(con)
+    m = load_matches(con, tour)
     con.close()
     m = m[m["seq"] < seq]
     _, engine = build_features(m, FeatureEngine(), emit_from_seq=10 ** 12)

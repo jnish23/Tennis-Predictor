@@ -7,8 +7,10 @@ it. The local cache, not the website, is the working copy.
 """
 from __future__ import annotations
 
+import io
 import json
 import logging
+import os
 import re
 import time
 from pathlib import Path
@@ -21,6 +23,7 @@ from tennis.config import (
     RAW_TML,
     START_YEAR,
     TD_BASE,
+    RAW_ONGOING_ARCHIVE,
     TML_API,
     TML_DATA,
 )
@@ -36,12 +39,52 @@ def _get(url: str, *, retries: int = 3, timeout: int = 60) -> bytes:
     for attempt in range(retries):
         try:
             r = requests.get(url, headers=HEADERS, timeout=timeout)
+            # A 4xx is the server's final answer (missing file, bad path);
+            # retrying it only delays the failure. 429 is the exception.
+            if 400 <= r.status_code < 500 and r.status_code != 429:
+                raise RuntimeError(f"failed to fetch {url}: HTTP {r.status_code}")
             r.raise_for_status()
             return r.content
+        except RuntimeError:
+            raise
         except Exception as exc:  # noqa: BLE001 - retry on any transport error
             last = exc
             time.sleep(1.5 * (attempt + 1))
     raise RuntimeError(f"failed to fetch {url}: {last}")
+
+
+def _write_atomic(dest: Path, data: bytes) -> None:
+    """Write via a temp file and rename, so a crash never leaves a torn file
+    in the cache -- the cache is the working copy, not the website."""
+    tmp = dest.with_name(f".{dest.name}.tmp{os.getpid()}")
+    tmp.write_bytes(data)
+    os.replace(tmp, dest)
+
+
+def archive_ongoing(name: str, data: bytes) -> int:
+    """Keep the latest snapshot of every tournament seen in an ongoing file.
+
+    The ongoing files are overwritten in place, and a tournament leaves them
+    before the maintainer folds it into the yearly file. Without a copy of its
+    own it vanished from the database for that gap (and CLAUDE.md asks for
+    every pulled CSV to be cached). One file per tournament, overwritten while
+    the tournament is still listed and left alone once it is not.
+    """
+    import pandas as pd
+    try:
+        df = pd.read_csv(io.BytesIO(data), dtype=str)
+    except Exception:  # noqa: BLE001 - an unreadable file is still cached raw
+        return 0
+    if df.empty or "tourney_id" not in df.columns:
+        return 0
+    out = RAW_ONGOING_ARCHIVE / Path(name).stem
+    out.mkdir(parents=True, exist_ok=True)
+    for tid, g in df.groupby("tourney_id"):
+        buf = io.BytesIO()
+        g.to_csv(buf, index=False)
+        _write_atomic(out / f"{re.sub(r'[^A-Za-z0-9_-]+', '_', str(tid))}.csv",
+                      buf.getvalue())
+    return df["tourney_id"].nunique()
 
 
 # --------------------------------------------------------------------------
@@ -87,12 +130,15 @@ def sync_tennismylife(*, force: bool = False, ongoing_only: bool = False) -> lis
         stale = force or name in ONGOING_FILES or manifest.get(name) != sig or not dest.exists()
         if not stale:
             continue
-        dest.write_bytes(_get(f.get("url") or f"{TML_DATA}/{name}"))
+        data = _get(f.get("url") or f"{TML_DATA}/{name}")
+        _write_atomic(dest, data)
+        if name in ONGOING_FILES:
+            archive_ongoing(name, data)
         manifest[name] = sig
         written.append(dest)
         log.info("cached %s (%s bytes)", name, dest.stat().st_size)
 
-    MANIFEST.write_text(json.dumps(manifest, indent=2, sort_keys=True))
+    _write_atomic(MANIFEST, json.dumps(manifest, indent=2, sort_keys=True).encode())
     return written
 
 
@@ -125,7 +171,7 @@ def sync_tennisdata(years: range | None = None, *, force: bool = False) -> list[
             # the extension is wrong, so a 200 + non-HTML body is the real test.
             if r.status_code == 200 and not r.content[:15].lstrip().startswith(b"<"):
                 dest = RAW_TD / f"{y}.{ext}"
-                dest.write_bytes(r.content)
+                _write_atomic(dest, r.content)
                 written.append(dest)
                 log.info("cached odds %s (%s bytes)", dest.name, len(r.content))
                 break

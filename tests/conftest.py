@@ -23,16 +23,16 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "needs_db: requires the local SQLite database or artifacts")
     config.addinivalue_line(
-        "markers", "features: additionally requires artifacts/features.parquet")
+        "markers", "features: additionally requires artifacts/features_atp.parquet")
 
 
 def pytest_collection_modifyitems(config, items):
     have_db = DB_PATH.exists()
-    have_feats = (ARTIFACTS / "features.parquet").exists()
+    have_feats = (ARTIFACTS / "features_atp.parquet").exists()
     for item in items:
         if "needs_db" not in item.keywords:
             continue
         if not have_db:
             item.add_marker(pytest.mark.skip(reason="no local database"))
         elif "features" in item.keywords and not have_feats:
-            item.add_marker(pytest.mark.skip(reason="no features.parquet"))
+            item.add_marker(pytest.mark.skip(reason="no features_atp.parquet"))

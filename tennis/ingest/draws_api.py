@@ -51,6 +51,8 @@ Credentials: set RAPIDAPI_KEY in the environment. Never commit it.
 """
 from __future__ import annotations
 
+import contextlib
+import fcntl
 import json
 import logging
 import os
@@ -93,17 +95,47 @@ def _key() -> str:
     return k
 
 
+@contextlib.contextmanager
+def _budget_lock():
+    """Serialise read-modify-write of the usage file across processes.
+
+    Two dashboard sessions clicking at once both read "39 used" and both wrote
+    40, so the budget undercounted exactly when it mattered.
+    """
+    with open(_BUDGET_FILE.with_suffix(".lock"), "w") as fh:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(fh, fcntl.LOCK_UN)
+
+
 def _spend(n: int = 1) -> None:
-    today = date.today().isoformat()
-    u = json.loads(_BUDGET_FILE.read_text()) if _BUDGET_FILE.exists() else {}
-    used = u.get(today, 0)
-    if used + n > DAILY_BUDGET:
-        raise DrawFeedError(
-            f"daily request budget exhausted ({used}/{DAILY_BUDGET}). "
-            "Raise RAPIDAPI_DAILY_BUDGET only if your plan allows it."
-        )
-    u = {today: used + n}
-    _BUDGET_FILE.write_text(json.dumps(u))
+    with _budget_lock():
+        today = date.today().isoformat()
+        try:
+            u = json.loads(_BUDGET_FILE.read_text())
+        except (FileNotFoundError, ValueError):
+            u = {}
+        used = u.get(today, 0)
+        if used + n > DAILY_BUDGET:
+            raise DrawFeedError(
+                f"daily request budget exhausted ({used}/{DAILY_BUDGET}). "
+                "Raise RAPIDAPI_DAILY_BUDGET only if your plan allows it."
+            )
+        _BUDGET_FILE.write_text(json.dumps({today: used + n}))
+
+
+def _refund(n: int = 1) -> None:
+    """Give back budget for a request that never reached the provider."""
+    with _budget_lock():
+        today = date.today().isoformat()
+        try:
+            u = json.loads(_BUDGET_FILE.read_text())
+        except (FileNotFoundError, ValueError):
+            return
+        u[today] = max(0, u.get(today, 0) - n)
+        _BUDGET_FILE.write_text(json.dumps(u))
 
 
 # The API paginates at 10 rows by default and honours `pageSize`. Asking for a
@@ -119,11 +151,16 @@ def _get(path: str, params: dict | None = None, *, cache_as: str | None = None,
     if cf and cf.exists() and (time.time() - cf.stat().st_mtime) < max_age_s:
         return json.loads(cf.read_text())
 
+    key = _key()                 # fail on a missing key before spending anything
     _spend()
-    r = requests.get(
-        f"{BASE}{path}", params=params or {}, timeout=30,
-        headers={"X-RapidAPI-Key": _key(), "X-RapidAPI-Host": HOST},
-    )
+    try:
+        r = requests.get(
+            f"{BASE}{path}", params=params or {}, timeout=30,
+            headers={"X-RapidAPI-Key": key, "X-RapidAPI-Host": HOST},
+        )
+    except requests.RequestException as exc:
+        _refund()                # never reached the provider: not quota used
+        raise DrawFeedError(f"request failed: {exc}") from exc
     if r.status_code == 429:
         raise DrawFeedError("rate limited / quota exceeded by the provider (429)")
     if r.status_code == 403:
@@ -139,7 +176,9 @@ def _get(path: str, params: dict | None = None, *, cache_as: str | None = None,
         )
     data = r.json()
     if cf:
-        cf.write_text(json.dumps(data))
+        tmp = cf.with_suffix(f".tmp{os.getpid()}")
+        tmp.write_text(json.dumps(data))
+        os.replace(tmp, cf)
     return data
 
 
@@ -321,6 +360,9 @@ def parse_draw_sheet(payload: dict, *, first_round_only: bool = True) -> pd.Data
             "round_id": x.get("roundId"),
             "draw_pos": x.get("draw"),
             "p1_name": p1.get("name"), "p2_name": None if is_bye else p2.get("name"),
+            "p1_id": p1.get("id"), "p2_id": None if is_bye else p2.get("id"),
+            "p1_ioc": p1.get("countryAcr"),
+            "p2_ioc": None if is_bye else p2.get("countryAcr"),
             "seed1": seed1,
             "seed2": None if is_bye else seed2,
             "is_bye": is_bye,
@@ -342,7 +384,7 @@ def parse_draw_sheet(payload: dict, *, first_round_only: bool = True) -> pd.Data
             .sort_values("draw_pos").reset_index(drop=True))
 
 
-def played_results(sheet: pd.DataFrame, con=None) -> pd.DataFrame:
+def played_results(sheet: pd.DataFrame, con=None, *, tour: str = "atp") -> pd.DataFrame:
     """Completed matches from a draw sheet, as (winner_id, loser_id).
 
     The sheet has no explicit winner field -- only a `result` score string and
@@ -360,12 +402,21 @@ def played_results(sheet: pd.DataFrame, con=None) -> pd.DataFrame:
         return pd.DataFrame(columns=["winner_id", "loser_id"])
     names = sorted({n for n in (*done["p1_name"], *done["p2_name"])
                     if isinstance(n, str) and n.strip()})
-    ids = resolve_players(names, con)
-    rows = [{"winner_id": ids.get(r.p1_name), "loser_id": ids.get(r.p2_name),
+    ids = resolve_players(names, con, tour=tour, meta=sheet_meta(done))
+    # An unresolved player keeps a stable placeholder instead of dropping the
+    # match: the draw gives them the same placeholder, so the tie still pins.
+    # Dropping the row left that tie "unplayed", and the bracket stopped
+    # pinning at the first such round -- thirty-odd finished matches were
+    # thrown away and re-simulated.
+    unresolved = sorted(n for n, v in ids.items() if v is None)
+    if unresolved:
+        log.warning("played_results: %d unresolved player(s) kept as "
+                    "placeholders: %s", len(unresolved), unresolved[:8])
+    rows = [{"winner_id": ids.get(r.p1_name) or unknown_id(r.p1_name),
+             "loser_id": ids.get(r.p2_name) or unknown_id(r.p2_name),
              "score": r.result}
             for r in done.itertuples()]
-    out = pd.DataFrame(rows).dropna(subset=["winner_id", "loser_id"])
-    return out.reset_index(drop=True)
+    return pd.DataFrame(rows).reset_index(drop=True)
 
 
 def resolve_tourney_key(feed_id: str | int, feed_name: str, player_ids,
@@ -459,7 +510,7 @@ def event_matches(tourney_key: str, con=None) -> pd.DataFrame:
 
 
 def verify_winner_convention(sheet: pd.DataFrame,
-                             our_matches: pd.DataFrame) -> dict:
+                             our_matches: pd.DataFrame, tour: str = "atp") -> dict:
     """Cross-check player1-is-winner against results we already hold.
 
     `our_matches` must be *this event's* rows only. Scoping matters twice over:
@@ -471,7 +522,7 @@ def verify_winner_convention(sheet: pd.DataFrame,
     rather than as both confirmed and contradicted -- the latter double-counted
     and could drive `unknown` negative.
     """
-    res = played_results(sheet)
+    res = played_results(sheet, tour=tour)
     if res.empty or our_matches.empty:
         return {"checked": len(res), "confirmed": 0, "contradicted": 0,
                 "unknown": len(res)}
@@ -488,9 +539,19 @@ def verify_winner_convention(sheet: pd.DataFrame,
             "unknown": len(res) - ok - bad}
 
 
+def _seed_num(v) -> float | None:
+    """'20' -> 20.0; 'WC', 'Q', None -> None (entry codes are not seeds)."""
+    try:
+        x = float(str(v).strip())
+    except (TypeError, ValueError):
+        return None
+    return x if x > 0 else None
+
+
 def build_draw_from_sheet(sheet: pd.DataFrame, *, name: str, surface: str,
                           level: str, best_of: int = 3, indoor: float = 0.0,
-                          tourney_date: int | None = None, con=None):
+                          tourney_date: int | None = None, con=None,
+                          tour: str = "atp"):
     """Build a simulator Draw from a draw sheet, preserving bracket order.
 
     Unlike the fixtures path, `draw_pos` gives the real bracket position, so
@@ -502,7 +563,7 @@ def build_draw_from_sheet(sheet: pd.DataFrame, *, name: str, surface: str,
     # A bye slot leaves p2_name as NaN, which is a float and would break sorting.
     names = sorted({n for n in (*sheet["p1_name"], *sheet["p2_name"])
                     if isinstance(n, str) and n.strip()})
-    ids = resolve_players(names, con)
+    ids = resolve_players(names, con, tour=tour, meta=sheet_meta(sheet))
     unresolved = [n for n, v in ids.items() if v is None]
 
     # A player we cannot match to our database is still a player. Marking them
@@ -510,13 +571,12 @@ def build_draw_from_sheet(sheet: pd.DataFrame, *, name: str, surface: str,
     # the same phantom-bye failure that let a stray entry walk a half-empty
     # draw to the title. They get a placeholder id instead, so the model scores
     # them from missing features (roughly a coin flip) and they can lose.
-    def _slot_for(name, resolved_id, counter=[0]):
+    def _slot_for(name, resolved_id):
         if resolved_id:
             return resolved_id
         if not isinstance(name, str) or not name.strip():
             return BYE
-        counter[0] += 1
-        return f"__UNKNOWN_{counter[0]}__"
+        return unknown_id(name)
 
     slots, labels = [], {}
     for row in sheet.itertuples():
@@ -529,11 +589,19 @@ def build_draw_from_sheet(sheet: pd.DataFrame, *, name: str, surface: str,
         if b != BYE and isinstance(row.p2_name, str):
             labels[b] = row.p2_name
 
+    # Seeds are on the sheet and training saw real ones; leaving them NaN here
+    # was a train/serve skew on a feature the model uses.
+    seeds = {}
+    for row in sheet.itertuples():
+        for pid_, sd in ((ids.get(row.p1_name), row.seed1),
+                         (ids.get(row.p2_name), row.seed2)):
+            if pid_ and _seed_num(sd):
+                seeds[pid_] = _seed_num(sd)
     ctx = MatchContext(
         surface=surface, level=level, best_of=best_of, indoor=indoor,
         draw_size=float(max(len(slots), 2)),
-        tourney_date=tourney_date or int(date.today().strftime("%Y%m%d")),
-        is_challenger=int(level == "challenger"),
+        tourney_date=tourney_date, tour=tour,
+        is_challenger=int(level == "challenger"), seeds=seeds or None,
     )
     draw = Draw(name=name, slots=slots, ctx=ctx, player_names=labels)
 
@@ -693,51 +761,112 @@ def first_round(fx: pd.DataFrame) -> pd.DataFrame:
     return fx[fx["round_id"] == fx["round_id"].min()].reset_index(drop=True)
 
 
-def resolve_players(names: list[str], con=None) -> dict[str, str | None]:
-    """Map feed names onto our ATP player ids by normalised name.
+def unknown_id(name) -> str:
+    """Stable placeholder id for a player we cannot resolve.
 
-    Same approach as the odds join, which reached 82% on a far messier surface.
-    Anything unmatched is returned as None so the caller can surface it rather
-    than silently simulating the wrong player.
+    Derived from the name, not a counter: a played result naming the same
+    player must land on the same placeholder as the draw slot, or the tie
+    reads as unplayed and the bracket stops pinning at that round.
     """
+    return "__UNKNOWN_" + norm_name(name).replace(" ", "_") + "__"
+
+
+def _name_keys(n: str) -> list[str]:
+    """Surname keys for a feed name, most likely reading first.
+
+    'Jannik Sinner' and 'Sinner J.' must both key to 'sinner|j'. A bare
+    initial token marks the abbreviated style. For two plain words the order is
+    NOT fixed: the feed is inconsistent about it (Zhang and Shang arrive
+    given-name-first, Bu Yunchaokete family-name-first), so both readings are
+    returned and the caller tries them in turn.
+    """
+    toks = norm_name(n).split()
+    if not toks:
+        return []
+    initials = [t for t in toks if len(t) == 1]
+    words = [t for t in toks if len(t) > 1]
+    if not words:
+        return [toks[0]]
+    if initials:                           # "Surname I." style
+        return [f"{words[-1]}|{initials[0]}"]
+    if len(words) == 1:
+        return [words[0]]
+    keys = [f"{words[-1]}|{words[0][0]}",  # "First Last"
+            f"{words[0]}|{words[-1][0]}"]  # "Last First"
+    return keys
+
+
+def resolve_players(names: list[str], con=None, *, tour: str = "atp",
+                    meta: dict | None = None) -> dict[str, str | None]:
+    """Map feed names onto our player ids.
+
+    Scoped to `tour`: the ATP and WTA share surname+initial keys (Alves,
+    Stearns, Lee), and an unscoped lookup would pick whoever played last.
+
+    Tried in order of how much each can be trusted:
+      0. the feed's own player id, once an earlier confident match recorded it
+      1. exact normalised name
+      2. the same words in any order ('Bu Yunchaokete' = 'Yunchaokete Bu')
+      3. surname+initial key, in either name order
+      4. each trailing token as the surname (compound surnames)
+    `meta` maps a name to {"feed_id", "ioc"}; the country narrows ties. A tie
+    that survives is broken toward the most recently active player and logged,
+    since that is a guess. Anything unmatched is None so the caller can
+    surface it rather than silently simulating the wrong player.
+    """
+    meta = meta or {}
     close = con is None
     con = con or connect()
-    players = pd.read_sql("SELECT player_id, name, name_norm, last_seen FROM players", con)
-    if close:
-        con.close()
-    # Prefer recently-active players when a normalised name collides.
+    players = pd.read_sql(
+        "SELECT player_id, name, name_norm, ioc, last_seen FROM players "
+        "WHERE tour = ?", con, params=(tour,))
+    xref = {}
+    try:
+        xref = dict(con.execute(
+            "SELECT feed_id, player_id FROM feed_player_xref WHERE tour = ?",
+            (tour,)).fetchall())
+    except Exception:  # noqa: BLE001 - table absent on an old database
+        pass
     players = players.sort_values("last_seen", ascending=False)
-    by_norm = players.drop_duplicates("name_norm").set_index("name_norm")["player_id"]
+    known = set(players["player_id"])
+    ioc_of = dict(zip(players["player_id"], players["ioc"]))
+    by_norm = players.groupby("name_norm")["player_id"].apply(list).to_dict()
+    players["tokens"] = players["name_norm"].map(lambda x: " ".join(sorted(x.split())))
+    by_tokens = players.groupby("tokens")["player_id"].apply(list).to_dict()
+    players["skey"] = players["name"].map(lambda x: (_name_keys(x) or [""])[0])
+    by_skey = players.groupby("skey")["player_id"].apply(list).to_dict()
 
-    def surname_key(n: str) -> str:
-        """'Jannik Sinner' and 'Sinner J.' must both key to 'sinner|j'.
+    def pick(cands: list[str], name: str, ioc: str | None):
+        """(player_id, confident) from candidates ordered most-recent first."""
+        if not cands:
+            return None, False
+        if ioc and len(cands) > 1:
+            same = [c for c in cands if ioc_of.get(c) == ioc]
+            cands = same or cands
+        if len(cands) > 1:
+            log.warning("ambiguous player %r matches %d players (%s); taking "
+                        "the most recently active", name, len(cands), cands[:4])
+        return cands[0], len(cands) == 1
 
-        The feed's name format is not pinned down by the docs, so this detects
-        the abbreviated style (a bare initial token) rather than assuming
-        first-name-first, which would key 'Sinner J.' as 'j|s'.
-        """
-        toks = norm_name(n).split()
-        if not toks:
-            return ""
-        initials = [t for t in toks if len(t) == 1]
-        words = [t for t in toks if len(t) > 1]
-        if not words:
-            return toks[0]
-        if initials:                       # "Surname I." style
-            return f"{words[-1]}|{initials[0]}"
-        if len(words) == 1:
-            return words[0]
-        return f"{words[-1]}|{words[0][0]}"  # "First Last" style
-
-    players["skey"] = players["name"].map(surname_key)
-    by_skey = players.drop_duplicates("skey").set_index("skey")["player_id"]
-
+    learned: list[tuple] = []
     out: dict[str, str | None] = {}
     for n in names:
+        m = meta.get(n) or {}
+        fid, ioc = m.get("feed_id"), m.get("ioc")
         nn = norm_name(n)
-        pid = by_norm.get(nn)
+        pid, sure = None, False
+
+        if fid is not None and xref.get(str(fid)) in known:
+            out[n] = xref[str(fid)]
+            continue
+        pid, sure = pick(by_norm.get(nn, []), n, ioc)
         if pid is None:
-            pid = by_skey.get(surname_key(n))
+            pid, sure = pick(by_tokens.get(" ".join(sorted(nn.split())), []), n, ioc)
+        if pid is None:
+            for key in _name_keys(n):
+                pid, sure = pick(by_skey.get(key, []), n, ioc)
+                if pid:
+                    break
         if pid is None:
             # Compound surnames are common in tennis and the two sources often
             # disagree on how many parts to keep ("Daniel Merida Aguilar" here
@@ -747,11 +876,38 @@ def resolve_players(names: list[str], con=None) -> dict[str, str | None]:
             if len(toks) > 2:
                 initial = toks[0][0]
                 for cand in toks[1:]:
-                    pid = by_skey.get(f"{cand}|{initial}")
+                    pid, sure = pick(by_skey.get(f"{cand}|{initial}", []), n, ioc)
                     if pid:
                         break
         out[n] = pid
+        if pid and sure and fid is not None:
+            learned.append((str(fid), tour, pid, n))
+
+    if learned:
+        try:
+            con.executemany(
+                "INSERT OR REPLACE INTO feed_player_xref(feed_id, tour, player_id, "
+                "feed_name, resolved_at) VALUES(?,?,?,?,datetime('now'))", learned)
+            con.commit()
+        except Exception as exc:  # noqa: BLE001 - a cache write must not fail a lookup
+            log.debug("could not record player xref: %s", exc)
+    if close:
+        con.close()
     return out
+
+
+def sheet_meta(sheet: pd.DataFrame) -> dict:
+    """{name: {"feed_id", "ioc"}} for the players on a parsed draw sheet."""
+    meta: dict = {}
+    for side in ("p1", "p2"):
+        if f"{side}_name" not in sheet.columns:
+            continue
+        for r in sheet.itertuples():
+            n = getattr(r, f"{side}_name")
+            if isinstance(n, str) and n.strip() and n not in meta:
+                meta[n] = {"feed_id": getattr(r, f"{side}_id", None),
+                           "ioc": getattr(r, f"{side}_ioc", None)}
+    return meta
 
 
 def seeded_positions(n_pairs: int) -> list[int]:
@@ -841,7 +997,7 @@ def order_fixtures_by_seed(fixtures: pd.DataFrame) -> pd.DataFrame:
 def build_draw_from_fixtures(fixtures: pd.DataFrame, *, name: str, surface: str,
                              level: str, best_of: int = 3,
                              indoor: float = 0.0, tourney_date: int | None = None,
-                             use_seeds: bool = True):
+                             use_seeds: bool = True, tour: str = "atp"):
     """Turn first-round fixtures into a simulator-ready Draw.
 
     The feed gives pairings but not bracket position. `order_fixtures_by_seed`
@@ -857,7 +1013,7 @@ def build_draw_from_fixtures(fixtures: pd.DataFrame, *, name: str, surface: str,
         fixtures = order_fixtures_by_seed(fixtures)
 
     names = sorted({*fixtures["p1_name"], *fixtures["p2_name"]})
-    ids = resolve_players(names)
+    ids = resolve_players(names, tour=tour)
     unresolved = [n for n, v in ids.items() if v is None]
 
     slots, labels = [], {}
@@ -868,11 +1024,16 @@ def build_draw_from_fixtures(fixtures: pd.DataFrame, *, name: str, surface: str,
         slots += [a, b]
         labels[a], labels[b] = f.p1_name, f.p2_name
 
+    seeds = {}
+    for f in fixtures.itertuples():
+        for pid_, sd in ((ids.get(f.p1_name), f.seed1), (ids.get(f.p2_name), f.seed2)):
+            if pid_ and _seed_num(sd):
+                seeds[pid_] = _seed_num(sd)
     ctx = MatchContext(
         surface=surface, level=level, best_of=best_of, indoor=indoor,
         draw_size=float(max(len(slots), 2)),
-        tourney_date=tourney_date or int(date.today().strftime("%Y%m%d")),
-        is_challenger=int(level == "challenger"),
+        tourney_date=tourney_date, tour=tour,
+        is_challenger=int(level == "challenger"), seeds=seeds or None,
     )
     draw = Draw(name=name, slots=slots, ctx=ctx, player_names=labels)
     return draw, unresolved

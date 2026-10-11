@@ -450,10 +450,13 @@ def resolve_matches(con=None) -> dict:
     checkbestodds joins: an accent-stripped surname+initial key for each player,
     paired order-independently, matched within a date window.
 
-    The window is +/-7 days because archived seasons stamp a match with the week
-    its tournament began while this source carries the true playing day; a
-    second-week match is legitimately six days adrift. A pair can only meet once
-    inside one tournament, and the nearest date wins regardless.
+    The window runs from the day before the event's start to 21 days after it.
+    Archived seasons stamp a match with the week its tournament began while this
+    source carries the true playing day, and a Slam final is 14 days in -- the
+    old +/-7 window left every Slam QF/SF/F and most late Masters rounds
+    unpriced. One-sided on purpose: of several events a pair could belong to,
+    the right one is the most recent that had begun by the play date. A pair can
+    only meet once inside one tournament.
 
     `p1_is_winner` is stored once, here. Every quote is keyed on their p1/p2,
     so orientation has to be resolved exactly once and reused -- deriving it per
@@ -465,13 +468,14 @@ def resolve_matches(con=None) -> dict:
     con = con or connect()
     try:
         te = pd.read_sql(
-            "SELECT te_id, play_date, p1_name, p2_name FROM te_matches "
+            "SELECT te_id, play_date, tour, p1_name, p2_name FROM te_matches "
             "WHERE match_id IS NULL AND p1_name NOT LIKE '%/%' "
             "AND p2_name NOT LIKE '%/%'", con)
         if te.empty:
             return {"resolved": 0, "note": "nothing unresolved"}
         m = pd.read_sql(
-            """SELECT m.match_id, m.tourney_date, pw.name AS w_name, pl.name AS l_name
+            """SELECT m.match_id, m.tourney_date, m.tour AS m_tour,
+                      pw.name AS w_name, pl.name AS l_name
                FROM matches m
                JOIN players pw ON pw.player_id = m.winner_id
                JOIN players pl ON pl.player_id = m.loser_id""", con)
@@ -484,10 +488,14 @@ def resolve_matches(con=None) -> dict:
         m["pair"] = [tuple(sorted(x)) for x in zip(m.kw, m.kl)]
 
         j = te.merge(m, on="pair", how="inner")
+        # tennisexplorer files Challengers under their own tour label; in our
+        # tables they are ATP-tour rows with a challenger flag.
+        te_tour = j["tour"].replace({"challenger": "atp"})
+        j = j[te_tour.isna() | (te_tour == j["m_tour"])]
         j["gap"] = (pd.to_datetime(j.play_date.astype(str), format="%Y%m%d")
                     - pd.to_datetime(j.tourney_date.astype(str), format="%Y%m%d")
-                    ).dt.days.abs()
-        j = j[j.gap <= 7].sort_values("gap")
+                    ).dt.days
+        j = j[j.gap.between(-1, 21)].sort_values("gap")
         # One te_id per match_id and vice versa: a pair meeting twice in a
         # season must not fan out into a cross product.
         j = j.drop_duplicates("te_id").drop_duplicates("match_id")

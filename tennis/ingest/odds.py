@@ -106,14 +106,18 @@ def join_odds(con) -> tuple[pd.DataFrame, dict]:
     td = read_odds_files()
     matches = pd.read_sql(
         "SELECT m.match_id, m.tourney_date, m.round, m.best_of, m.winner_id,"
-        "       m.loser_id, m.is_challenger_flag, pw.name AS w_name, pl.name AS l_name "
+        "       m.loser_id, m.tour, m.is_challenger_flag, pw.name AS w_name, pl.name AS l_name "
         "FROM (SELECT m.*, t.is_challenger AS is_challenger_flag FROM matches m "
         "      JOIN tournaments t USING(tourney_key)) m "
         "JOIN players pw ON pw.player_id = m.winner_id "
         "JOIN players pl ON pl.player_id = m.loser_id",
         con,
     )
-    main = matches[matches["is_challenger_flag"] == 0].copy()
+    # tennis-data.co.uk's workbooks are the ATP's. Counting WTA matches in the
+    # denominator read a 0.43 match rate against a real ~0.82, and a WTA pairing
+    # that happened to share name keys could claim an ATP row.
+    main = matches[(matches["is_challenger_flag"] == 0)
+                   & (matches["tour"] == "atp")].copy()
     main["season"] = main["tourney_date"] // 10000
     main["w_key"] = main["w_name"].map(_key_from_full)
     main["l_key"] = main["l_name"].map(_key_from_full)
@@ -158,9 +162,15 @@ def join_odds(con) -> tuple[pd.DataFrame, dict]:
     # checkbestodds Challenger prices vanished on the next run of this
     # function, because `odds` is now shared with `odds_cbo` (CBO) and
     # `odds_live` (TE_CLOSE), neither of which existed when this was written.
+    # One transaction: `to_sql` would commit the DELETE on its own and a
+    # failed insert would leave these books empty.
     con.executemany("DELETE FROM odds WHERE book = ?",
                     [(b,) for b in BOOK_PAIRS])
-    odds.to_sql("odds", con, if_exists="append", index=False)
+    con.executemany(
+        "INSERT OR REPLACE INTO odds(match_id, book, win_price, lose_price) "
+        "VALUES(?,?,?,?)",
+        odds[["match_id", "book", "win_price", "lose_price"]]
+        .itertuples(index=False, name=None))
 
     # Upgrade weekly stamps to true match dates where the join succeeded.
     exact = cand[["match_id", "Date"]].dropna()

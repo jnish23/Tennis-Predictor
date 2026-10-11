@@ -71,8 +71,13 @@ def parse_score(score: str | float | None, best_of: int | None = None) -> Parsed
     sets: list[tuple[int, int]] = []
     tiebreaks = 0
     malformed = False
-    for tok in _TOKEN_CLEAN.sub("", s).split():
-        t = tok.strip()
+    for raw_tok in s.split():
+        # A bracketed score, "[10-7]", is a match tiebreak played in place of a
+        # deciding set. It is a set won for the sets count but a single game
+        # for the games count -- scoring it 10-7 made a 17-game "set" and fed
+        # that to the totals model as a label.
+        is_mtb = raw_tok.startswith("[")
+        t = _TOKEN_CLEAN.sub("", raw_tok).strip()
         if not t:
             continue
         if t.upper() in {"RET", "DEF", "W/O", "ABN", "ABD", "(RET)", "-"}:
@@ -88,6 +93,9 @@ def parse_score(score: str | float | None, best_of: int | None = None) -> Parsed
             continue
         if m.group(3) is not None:
             tiebreaks += 1
+        if is_mtb:
+            tiebreaks += 1
+            wg, lg = (1, 0) if wg > lg else (0, 1)
         sets.append((wg, lg))
 
     if not sets:
@@ -112,11 +120,17 @@ def parse_score(score: str | float | None, best_of: int | None = None) -> Parsed
     # plausible set target. We check against {2,3} rather than the declared
     # best_of because a few hundred rows carry a mislabelled best_of; the score
     # itself is the more reliable witness.
+    # A best-of-5 record showing only two sets won is an unfinished match, not a
+    # short one, and is no totals label. The reverse is not symmetric: three
+    # sets won cannot happen in a best-of-3, so that is a mislabelled best_of
+    # (the score is the more reliable witness) and the match is complete.
+    target = {3: (2, 3), 5: (3,)}.get(int(best_of) if best_of == best_of and best_of else 0,
+                                    (2, 3))
     ps.usable_for_totals = (
         status == COMPLETED
         and not malformed
         and w_sets > l_sets
-        and w_sets in (2, 3)
+        and w_sets in target
         and l_sets <= 2
         and len(sets) <= 5
         and sets[-1][0] > sets[-1][1]  # winner took the final set

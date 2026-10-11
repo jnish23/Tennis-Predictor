@@ -72,32 +72,72 @@ def _attach_labels(feats: pd.DataFrame, con) -> pd.DataFrame:
     return out
 
 
+def _full_rebuild_reason(prior: pd.DataFrame, matches: pd.DataFrame) -> str | None:
+    """Why the saved state cannot be extended, or None if it can.
+
+    Incremental correctness needs the engine to have folded in exactly a prefix
+    of what the database holds now. `seq` cannot tell us that: the reload
+    renumbers it on every run, so "seq > last_seq" silently skipped 1,134
+    matches and double-counted others whose ids had moved. Match ids are stable,
+    so compare those.
+    """
+    have = set(matches["match_id"])
+    gone = ~prior["match_id"].isin(have)
+    if gone.any():
+        # Their results are already folded into ratings; they cannot be undone.
+        return f"{int(gone.sum())} folded-in matches no longer exist"
+    new = matches[~matches["match_id"].isin(set(prior["match_id"]))]
+    if len(new) and new["tourney_date"].min() < prior["tourney_date"].max():
+        # A match older than state already folded would be rated with the
+        # future in view -- exactly the leak this engine exists to prevent.
+        return "new matches pre-date the saved state"
+    return None
+
+
+def _renumber(feats: pd.DataFrame, matches: pd.DataFrame) -> pd.DataFrame:
+    """Bring stored rows' seq (and date) in line with the current numbering."""
+    cur = matches.set_index("match_id")
+    out = feats.copy()
+    out["seq"] = out["match_id"].map(cur["seq"]).astype("int64")
+    return out
+
+
 def run(full: bool = True, tour: str = "atp") -> dict:
     """Full rebuild, or incremental extension from the saved engine state."""
     t0 = time.time()
     features_p, state_p = features_path(tour), state_path(tour)
     con = connect()
-    matches = load_matches(con, tour)
+    all_matches = matches = load_matches(con, tour)
 
     engine = None
-    emit_from = -1
     prior = None
     if not full and state_p.exists() and features_p.exists():
-        engine = FeatureEngine.load(state_p)
-        emit_from = engine.last_seq
-        prior = pd.read_parquet(features_p)
-        # Replay only what the engine has not already folded in.
-        matches = matches[matches["seq"] > engine.last_seq]
-        log.info("incremental: %d new matches after seq %d", len(matches), emit_from)
-        if matches.empty:
-            con.close()
-            return {"new_rows": 0, "total_rows": len(prior), "seconds": 0.0}
+        prior = pd.read_parquet(features_p, columns=["match_id", "tourney_date"])
+        reason = _full_rebuild_reason(prior, matches)
+        if reason:
+            log.warning("incremental not possible (%s); rebuilding %s in full",
+                        reason, tour)
+            prior = None
+        else:
+            engine = FeatureEngine.load(state_p)
+            seen = set(prior["match_id"])
+            matches = matches[~matches["match_id"].isin(seen)]
+            log.info("incremental: %d new matches", len(matches))
+            prior = pd.read_parquet(features_p)
+            if matches.empty:
+                # Nothing to fold in, but seq was renumbered by the reload.
+                prior = _renumber(prior, all_matches)
+                prior.to_parquet(features_p, index=False)
+                con.close()
+                return {"tour": tour, "new_rows": 0, "total_rows": len(prior),
+                        "seconds": round(time.time() - t0, 1)}
 
-    feats, engine = build_features(matches, engine, emit_from_seq=emit_from)
+    feats, engine = build_features(matches, engine)
     feats = _attach_labels(feats, con)
+    engine.last_seq = int(all_matches["seq"].max())
 
     if prior is not None and len(prior):
-        feats = pd.concat([prior, feats], ignore_index=True)
+        feats = pd.concat([_renumber(prior, all_matches), feats], ignore_index=True)
         feats = feats.drop_duplicates("match_id", keep="last")
     feats = feats.sort_values("seq").reset_index(drop=True)
     feats["tour"] = tour
