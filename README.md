@@ -11,6 +11,14 @@ cloud VM that document refers to does not exist — see `deploy/` for what this
 actually needs to run (short version: 563 MB to serve, and it runs fine on a
 laptop).
 
+## Live site
+
+The public dashboard is a Streamlit app (URL: *added after the first deploy*). It
+is rebuilt every day on GitHub Actions and downloads its data as one bundle from
+a GitHub Release, so it works without this repository's database and stays
+current without any machine of mine being awake. The sidebar shows how fresh
+the data is. See [deploy/README.md](deploy/README.md#public-site-recommended-github-actions--releases--streamlit-community-cloud).
+
 ## Quick start
 
 ```bash

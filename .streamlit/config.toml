@@ -1,0 +1,11 @@
+[server]
+headless = true
+# The public app is read-only; there is nothing to watch for changes.
+fileWatcherType = "none"
+maxUploadSize = 1
+
+[browser]
+gatherUsageStats = false
+
+[theme]
+base = "light"

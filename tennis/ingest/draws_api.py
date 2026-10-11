@@ -144,10 +144,38 @@ def _refund(n: int = 1) -> None:
 PAGE_SIZE = 300
 
 
+def cache_only() -> bool:
+    """Serve from the shipped cache and never call the provider.
+
+    The public dashboard has a bundle of draw sheets fetched by the daily job;
+    letting visitors trigger live calls would spend the job's quota on strangers.
+    It is on when the app is running from a bundle and holds no API key, or
+    when forced with TENNIS_DRAWS_CACHE_ONLY=1.
+    """
+    if os.getenv("TENNIS_DRAWS_CACHE_ONLY") == "1":
+        return True
+    return bool(os.getenv("DATA_BUNDLE_URL")) and not os.getenv("RAPIDAPI_KEY")
+
+
 def _get(path: str, params: dict | None = None, *, cache_as: str | None = None,
-         max_age_s: int = 3600) -> dict:
-    """GET with on-disk caching, so repeated dashboard clicks cost no quota."""
+         max_age_s: int = 3600, stale_glob: str | None = None) -> dict:
+    """GET with on-disk caching, so repeated dashboard clicks cost no quota.
+
+    In cache-only mode age is ignored, and `stale_glob` names the family of
+    files to fall back on (the newest wins) when the exact key was never
+    fetched -- a date-keyed request made a day after the job ran.
+    """
     cf = CACHE / f"{cache_as}.json" if cache_as else None
+    if cache_only():
+        if cf and cf.exists():
+            return json.loads(cf.read_text())
+        near = sorted(CACHE.glob(stale_glob), key=lambda p: p.stat().st_mtime) if stale_glob else []
+        if near:
+            return json.loads(near[-1].read_text())
+        raise DrawFeedError(
+            "no cached draw data for this request, and live fetching is off on "
+            "the public site (the daily job fetches draws for events starting "
+            "within three days)")
     if cf and cf.exists() and (time.time() - cf.stat().st_mtime) < max_age_s:
         return json.loads(cf.read_text())
 
@@ -210,7 +238,8 @@ def fixtures_between(start: str, end: str, tour: str = "atp") -> dict:
     """Scheduled fixtures in a date window (YYYY-MM-DD)."""
     return _get(f"/{tour}/fixtures/{start}/{end}",
                 {"pageSize": PAGE_SIZE, "include": "tournament"},
-                cache_as=f"range_{tour}_{start}_{end}", max_age_s=1800)
+                cache_as=f"range_{tour}_{start}_{end}", max_age_s=1800,
+                stale_glob=f"range_{tour}_*.json")
 
 
 BYE_PLAYER_ID = 3700  # the feed's "Unknown Player" sentinel, used for byes

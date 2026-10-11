@@ -8,6 +8,7 @@ Run:  streamlit run dashboard/app.py
 from __future__ import annotations
 
 import json
+import os
 import sys
 from pathlib import Path
 
@@ -23,8 +24,59 @@ from tennis.config import ARTIFACTS  # noqa: E402
 from tennis.db.schema import connect  # noqa: E402
 from tennis.models.common import calibration_table  # noqa: E402
 
-st.set_page_config(page_title="ATP Prediction Model", layout="wide",
+st.set_page_config(page_title="Tennis Prediction Model", layout="wide",
                    page_icon="🎾")
+
+# --------------------------------------------------------------------------
+# hosted data
+# --------------------------------------------------------------------------
+BUNDLE_MAX_AGE_H = 6.0
+
+
+def refresh_hosted_data() -> None:
+    """On the public site, keep the local data no more than a few hours old.
+
+    Only active when DATA_BUNDLE_URL is set; on a laptop the pipeline writes
+    the data and this does nothing. A refresh clears the Streamlit caches,
+    which would otherwise keep serving the previous bundle's ratings and models.
+    """
+    url = os.environ.get("DATA_BUNDLE_URL")
+    if not url:
+        return
+    from tennis.ops import bundle
+    if not bundle.is_stale(BUNDLE_MAX_AGE_H):
+        return
+    try:
+        with st.spinner("Downloading the latest data (about 250 MB, first visit only)…"):
+            bundle.fetch_serve(url)
+        st.cache_data.clear()
+        st.cache_resource.clear()
+    except Exception as exc:  # noqa: BLE001 - show it, don't crash the page
+        if bundle.local_meta() is None:
+            st.error(f"No data available yet, and the download failed: {exc}")
+            st.stop()
+        st.warning(f"Could not refresh the data ({exc}); showing the previous copy.")
+
+
+def data_as_of() -> str:
+    """One line for the sidebar: how fresh what you are looking at is."""
+    from tennis.ops import bundle
+    meta = bundle.local_meta()
+    parts = []
+    try:
+        run = json.loads((ARTIFACTS / "last_daily_run.json").read_text())
+        thru = run.get("data_through") or (meta or {}).get("max_tourney_date")
+        if thru:
+            t = str(int(thru))
+            parts.append(f"matches through {t[:4]}-{t[4:6]}-{t[6:]}")
+        parts.append(f"{run.get('kind', 'daily')} run {run.get('finished', run.get('started', ''))[:16].replace('T', ' ')} UTC")
+    except (FileNotFoundError, ValueError):
+        if meta:
+            parts.append(f"built {meta.get('built_at', '')[:16].replace('T', ' ')} UTC")
+    return "Data as of: " + " · ".join(parts) if parts else "Data freshness unknown."
+
+
+refresh_hosted_data()
 
 SURFACES = ["Hard", "Clay", "Grass", "Carpet"]
 LEVELS = ["grand_slam", "masters", "atp500", "atp250", "finals", "davis_cup",
@@ -2269,6 +2321,7 @@ PAGES = {
 }
 
 st.sidebar.title("🎾 Tennis model")
+st.sidebar.caption(data_as_of())
 st.sidebar.radio("Tour", list(TOURS), key="tour_label", horizontal=True)
 choice = st.sidebar.radio("Page", list(PAGES))
 if current_tour() == "atp":

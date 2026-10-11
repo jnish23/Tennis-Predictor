@@ -254,6 +254,30 @@ def breakout(bt: pd.DataFrame, by: str) -> pd.DataFrame:
     return pd.DataFrame(rows).sort_values("n", ascending=False)
 
 
+def _carry_market_lines(rep: dict, tour: str) -> None:
+    """Keep the previous report's games-market block when this run has none.
+
+    The block rests on `odds_quotes`, a research table that exists only on the
+    machine that ran the backfill. Where it is absent (a cloud rebuild) the last
+    computed block is kept, stamped with how old it is, rather than silently
+    dropping the section from the dashboard.
+    """
+    if "market_lines" in rep:
+        return
+    prior = ARTIFACTS / f"backtest_report_{tour}.json"
+    if not prior.exists():
+        return
+    try:
+        old = json.loads(prior.read_text())
+    except ValueError:
+        return
+    if old.get("market_lines"):
+        rep["market_lines"] = {
+            **old["market_lines"],
+            "carried_forward_from": old["market_lines"].get("carried_forward_from")
+            or old.get("generated_at", "an earlier run")}
+
+
 def _verdict(rep: dict, best_roi: float, beats_close: bool | None) -> str:
     """One-paragraph reading of the numbers in `rep`, written from the numbers.
 
@@ -363,6 +387,9 @@ def full_report(book: str = "PS", tour: str = "atp") -> dict:
             con.close()
     except Exception as exc:
         log.warning("market-line comparison skipped: %s", exc)
+
+    _carry_market_lines(rep, tour)
+    rep["generated_at"] = pd.Timestamp.now("UTC").isoformat(timespec="seconds")
 
     rep["headline"] = {
         "winner_beats_elo_baseline": rep["winner"]["log_loss"] < rep["winner_elo_baseline"]["log_loss"],

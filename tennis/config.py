@@ -26,14 +26,19 @@ def _load_dotenv(path: Path) -> None:
 
 
 _load_dotenv(ROOT / ".env")
-DATA = ROOT / "data"
+# Overridable so the cloud jobs (and tests) can work in a scratch directory
+# without touching the laptop's database.
+DATA = Path(os.environ.get("TENNIS_DATA_DIR") or ROOT / "data")
 RAW_TML = DATA / "raw" / "tennismylife"
 RAW_TD = DATA / "raw" / "tennisdata"
 RAW_ONGOING_ARCHIVE = DATA / "raw" / "tennismylife_ongoing"
-ARTIFACTS = ROOT / "artifacts"
+# Every ongoing file as pulled, under a dated name. Kept apart from the
+# per-tournament snapshots above: load.read_raw globs that directory.
+RAW_ONGOING_DATED = DATA / "raw" / "tennismylife_dated"
+ARTIFACTS = Path(os.environ.get("TENNIS_ARTIFACTS_DIR") or ROOT / "artifacts")
 DB_PATH = DATA / "tennis.db"
 
-for _p in (RAW_TML, RAW_TD, RAW_ONGOING_ARCHIVE, ARTIFACTS):
+for _p in (RAW_TML, RAW_TD, RAW_ONGOING_ARCHIVE, RAW_ONGOING_DATED, ARTIFACTS):
     _p.mkdir(parents=True, exist_ok=True)
 
 # Scope: ATP (main tour + challenger) and WTA (main tour only -- the source

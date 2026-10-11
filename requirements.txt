@@ -15,6 +15,7 @@ xlrd==2.0.2
 requests==2.34.2
 beautifulsoup4==4.15.0   # odds scrapers (tennisexplorer, checkbestodds)
 pyarrow==24.0.0
+zstandard==0.25.0
 pytest==9.1.1
 matplotlib==3.11.1
 optuna==4.9.0   # optional: Bayesian search in notebooks/model_analysis.py

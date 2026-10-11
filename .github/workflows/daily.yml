@@ -1,0 +1,59 @@
+name: daily
+
+# Rebuilds the site's data from the raw files and publishes it. Runs on GitHub's
+# runners because the laptop it used to run on is only awake some of the time.
+# The Streamlit app downloads serve.tar.zst from the data-latest release.
+#
+# Features are rebuilt in full every run: it needs no saved engine state, is
+# deterministic, and picks up upstream corrections to already-played matches.
+
+on:
+  schedule:
+    - cron: "30 6 * * *"      # GitHub schedules drift 5-30 minutes; that is fine here
+  workflow_dispatch:
+
+# One pipeline run at a time, shared with weekly and odds, so two jobs never
+# rewrite the release assets over each other. Queued runs wait rather than cancel.
+concurrency:
+  group: data-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write              # release assets
+
+jobs:
+  daily:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      GH_TOKEN: ${{ github.token }}
+      RAPIDAPI_KEY: ${{ secrets.RAPIDAPI_KEY }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Make sure the data release exists
+        run: |
+          gh release view data-latest >/dev/null 2>&1 || gh release create data-latest \
+            --title "Pipeline data" --prerelease \
+            --notes "Rolling assets replaced by the scheduled workflows. Not a software release."
+
+      - name: Restore state
+        run: |
+          mkdir -p .restore data
+          gh release download data-latest -p state.tar.zst -p odds_snapshots.parquet --dir .restore --clobber || true
+          if [ -f .restore/state.tar.zst ]; then python -m tennis.ops.bundle unpack-state .restore/state.tar.zst; fi
+          if [ -f .restore/odds_snapshots.parquet ]; then cp .restore/odds_snapshots.parquet data/; fi
+
+      - name: Run pipeline
+        run: python -m tennis.ops.cloud daily --out dist
+
+      - name: Publish
+        run: gh release upload data-latest dist/serve.tar.zst dist/state.tar.zst --clobber
