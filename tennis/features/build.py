@@ -18,6 +18,7 @@ import math
 import pickle
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from itertools import islice
 
 import numpy as np
 import pandas as pd
@@ -45,8 +46,9 @@ def _side_is_winner_first(match_id: str) -> bool:
 def _mean(dq, n=None):
     if not dq:
         return np.nan
-    vals = list(dq)[-n:] if n else list(dq)
-    return float(np.mean(vals)) if vals else np.nan
+    # Walk the tail only; list(dq) copied the whole deque on every call.
+    vals = list(islice(reversed(dq), n)) if n else dq
+    return float(np.mean(vals)) if len(vals) else np.nan
 
 
 def _safe_div(a, b):
@@ -267,11 +269,13 @@ class FeatureEngine:
             out[f"log_{c}"] = math.log(out[c]) if out[c] and out[c] > 0 else np.nan
 
         # head-to-head, oriented to p1
-        out["h2h_p1"] = self.h2h[(p1, p2)]
-        out["h2h_p2"] = self.h2h[(p2, p1)]
+        # .get, not []: indexing a defaultdict inserts the key, so every
+        # prediction grew the saved and cached engines.
+        out["h2h_p1"] = self.h2h.get((p1, p2), 0)
+        out["h2h_p2"] = self.h2h.get((p2, p1), 0)
         out["h2h_n"] = out["h2h_p1"] + out["h2h_p2"]
-        out["h2h_surf_p1"] = self.h2h_surf[(p1, p2, surface)]
-        out["h2h_surf_p2"] = self.h2h_surf[(p2, p1, surface)]
+        out["h2h_surf_p1"] = self.h2h_surf.get((p1, p2, surface), 0)
+        out["h2h_surf_p2"] = self.h2h_surf.get((p2, p1, surface), 0)
 
         # match context
         out["best_of"] = row["best_of"]
@@ -320,10 +324,22 @@ class FeatureEngine:
         date_ord = _date_to_ord(int(row["tourney_date"]))
         w, l = row["winner_id"], row["loser_id"]
 
+        # Opponent strength is what was known going in, so read it before this
+        # match touches either rating.
+        w_pre = self.elo.get(w, "overall", date_ord)
+        l_pre = self.elo.get(l, "overall", date_ord)
+
+        # Layoff decay owed to every scope is realised now, while the old clock
+        # still says how long they were idle.
+        self.elo.advance(w, date_ord)
+        self.elo.advance(l, date_ord)
+
         # Elo: a retirement is still a win, so it rates; a walkover does not.
-        self.elo.update(w, l, "overall", day=date_ord)
+        # Surface goes first: a surface rating's first update is seeded from
+        # the overall rating, which must still be the pre-match value.
         if surface:
             self.elo.update(w, l, surface, day=date_ord)
+        self.elo.update(w, l, "overall", day=date_ord)
         # Stop the layoff clock only once both scopes have updated -- they share
         # it, and touching earlier would cancel the decay the surface update is
         # owed. Every later read at this date_ord then sees a zero-length gap.
@@ -335,9 +351,6 @@ class FeatureEngine:
             self.h2h_surf[(w, l, surface)] += 1
 
         sw, sl = self.players[w], self.players[l]
-        # Opponent strength is read from Elo *before* this match updates it,
-        # so it reflects what was known going in.
-        w_pre, l_pre = self.elo.get(w, "overall"), self.elo.get(l, "overall")
         sw.results.append(1.0)
         sl.results.append(0.0)
         for k in EWMA_HALFLIVES:
@@ -425,12 +438,15 @@ class FeatureEngine:
             me.rpw.append(1.0 - (o_first + o_second) / o_svpt)
         if bpf and bpf > 0:
             me.bp_saved.append(bps / bpf)
-        if svgms and svgms > 0:
+        # Missing break-point counts must stay missing. `max(0.0, nan)` is 0.0
+        # and `min(1.0, nan)` is 1.0 in Python, so a NaN used to become a 0%
+        # hold or a 100% break.
+        if svgms and svgms > 0 and not (pd.isna(bpf) or pd.isna(bps)):
             # break points converted against us is the usual proxy for breaks
-            breaks_lost = max((bpf or 0) - (bps or 0), 0)
+            breaks_lost = max(bpf - bps, 0)
             me.hold.append(max(0.0, 1.0 - breaks_lost / svgms))
-        if o_svgms and o_svgms > 0:
-            breaks_made = max((o_bpf or 0) - (o_bps or 0), 0)
+        if o_svgms and o_svgms > 0 and not (pd.isna(o_bpf) or pd.isna(o_bps)):
+            breaks_made = max(o_bpf - o_bps, 0)
             me.brk.append(min(1.0, breaks_made / o_svgms))
 
     # -- persistence -------------------------------------------------------

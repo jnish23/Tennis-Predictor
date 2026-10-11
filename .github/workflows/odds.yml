@@ -1,0 +1,61 @@
+name: odds
+
+# Captures tennisexplorer's current prices every three hours and appends them to
+# odds_snapshots.parquet on the data release. Only the price nearest a match's
+# start is a closing line, so frequency is the whole point of this job.
+
+on:
+  schedule:
+    - cron: "5 */3 * * *"
+  workflow_dispatch:
+
+concurrency:
+  group: data-pipeline
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+
+jobs:
+  odds:
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Make sure the data release exists
+        run: |
+          gh release view data-latest >/dev/null 2>&1 || gh release create data-latest \
+            --title "Pipeline data" --prerelease \
+            --notes "Rolling assets replaced by the scheduled workflows. Not a software release."
+
+      # Datacenter IPs are sometimes refused by scraped sites. Fail loudly and
+      # early with the status, rather than writing an empty capture; if this
+      # ever fires, hide the Betting page on the public site (see deploy/README).
+      - name: Probe tennisexplorer
+        run: |
+          code=$(curl -sS -o /dev/null -w "%{http_code}" -A "tennis-predictor" "https://www.tennisexplorer.com/matches/?type=atp-single")
+          echo "tennisexplorer answered HTTP $code"
+          if [ "$code" != "200" ]; then echo "::error::tennisexplorer refused this runner (HTTP $code)"; exit 1; fi
+
+      - name: Restore snapshots
+        run: |
+          mkdir -p .restore data
+          gh release download data-latest -p odds_snapshots.parquet --dir .restore --clobber || true
+          if [ -f .restore/odds_snapshots.parquet ]; then cp .restore/odds_snapshots.parquet data/; fi
+
+      - name: Capture
+        run: python -m tennis.ops.cloud odds --out dist
+
+      - name: Publish snapshots
+        run: gh release upload data-latest dist/odds_snapshots.parquet --clobber

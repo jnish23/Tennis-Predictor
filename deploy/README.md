@@ -1,9 +1,70 @@
 # Deployment
 
-CLAUDE.md said to deploy alongside an existing NBA dashboard on a shared cloud
-VM. **There is no such VM** — that premise turned out not to hold, so there is
-no host to co-locate with and the sizing question is open. Nothing here has been
-run against any server.
+## Public site (recommended): GitHub Actions + Releases + Streamlit Community Cloud
+
+```
+GitHub Actions                         GitHub Release "data-latest"            Streamlit Community Cloud
+  daily.yml   06:30 UTC  ─┐             state.tar.zst   raw CSVs, models  ─┐     dashboard/app.py
+  weekly.yml  Mon 07:30  ─┼─ publish ─▶ serve.tar.zst   slim db + artifacts ─┼─▶  downloads serve.tar.zst on start
+  odds.yml    every 3 h  ─┘             odds_snapshots.parquet               │     and when its copy is >6 h old
+```
+
+The laptop database is 6.5 GB, but 6.1 GB of it is `odds_quotes`, research data
+from the tennisexplorer backfill that no page reads. The site needs ~150 MB of
+core tables plus ~120 MB of artifacts, which the jobs rebuild from ~72 MB of raw
+files and ship as one download. Nothing is stored in git.
+
+* **daily** restores `state.tar.zst`, pulls TennisMyLife and the current
+  tennis-data workbook, reloads, rebuilds features for both tours in full
+  (no saved engine state, so no incremental drift), refreshes the reports,
+  prefetches draw sheets for events starting within three days, and publishes.
+* **weekly** does the same plus the walk-forward backtest and a production refit.
+* **odds** captures prices every three hours into `odds_snapshots.parquet`. Only
+  the price nearest a match's start is a closing line, so frequency is the point.
+  It first probes tennisexplorer and fails loudly if GitHub's IPs are refused;
+  if that happens, hide the Betting page on the public site.
+* The app runs **cache-only for draws**: visitors never spend the RapidAPI quota.
+  Set `RAPIDAPI_KEY` as an app secret only if you want live fetches (capped by
+  `RAPIDAPI_DAILY_BUDGET`).
+
+### One-time setup
+
+1. Make the repository public (Actions minutes are unlimited for public repos).
+2. Add the repo secret `RAPIDAPI_KEY` (optional; without it draws are not prefetched).
+3. Seed the cloud with this machine's history, so it starts from your odds
+   snapshots instead of from nothing:
+
+   ```bash
+   .venv/bin/python -m tennis.ops.bundle pack-state /tmp/state.tar.zst
+   .venv/bin/python -m tennis.ops.bundle export-snapshots /tmp/odds_snapshots.parquet
+   gh release create data-latest --prerelease --title "Pipeline data" --notes "Rolling assets"
+   gh release upload data-latest /tmp/state.tar.zst /tmp/odds_snapshots.parquet
+   ```
+4. Run **weekly** once from the Actions tab (`workflow_dispatch`): it publishes
+   `serve.tar.zst`. Check the run's wall time and peak memory in its log.
+5. On share.streamlit.io, create an app from this repo with main file
+   `dashboard/app.py` and the secret
+   `DATA_BUNDLE_URL = "https://github.com/<owner>/<repo>/releases/download/data-latest/serve.tar.zst"`.
+6. Once the scheduled runs are green for a few days, retire the laptop agents:
+   `launchctl unload ~/Library/LaunchAgents/com.tennis.{odds,daily,weekly}.plist`.
+   The odds *backfill* (`odds_te_hist`) stays local research and is unaffected.
+
+### Things that can go wrong
+
+* **Memory on Streamlit Cloud.** Serving peaks around 560 MB, but a *replay*
+  rebuilds feature state from every match. If it does not fit, move the same app
+  to a Hugging Face Space (16 GB); nothing else changes.
+* **Cron jitter.** Scheduled runs often start 5-30 minutes late. Harmless for
+  daily; the 3-hourly capture drifts slightly.
+* **60-day inactivity.** Scheduled workflows are disabled after 60 days without
+  repository activity. The weekly job makes a small empty commit in the first
+  week of each month to prevent it (this needs the default branch to accept
+  pushes from `github-actions`).
+
+## Local machine (research and fallback)
+
+The sections below describe running everything on this laptop. It remains the
+research machine: the odds backfill and the 7.5 GB scrape cache live here.
 
 ## Do you actually need a VM?
 

@@ -85,6 +85,15 @@ ABS_FEATURES = ["d_elo", "d_elo_surf", "d_rank", "d_log_rank", "d_serve_edge",
 TOURS = ("atp", "wta")
 
 
+def _playable(df: pd.DataFrame) -> pd.DataFrame:
+    """Drop walkovers. Nothing was played, so there is no result to predict or
+    to be scored on -- they inflated the training and backtest sets by 1,324
+    rows. The engine still emits them; they just never reach a model."""
+    if "status" not in df.columns:
+        return df
+    return df[df["status"] != "walkover"].reset_index(drop=True)
+
+
 def load_features(tour: str = "pooled") -> pd.DataFrame:
     """Features for one tour, or both pooled with `tour` as a model feature.
 
@@ -101,8 +110,8 @@ def load_features(tour: str = "pooled") -> pd.DataFrame:
     below cuts both tours at the same instant rather than by position.
     """
     if tour != "pooled":
-        return prepare(pd.read_parquet(features_path(tour)))
-    frames = [pd.read_parquet(features_path(t)) for t in TOURS]
+        return prepare(_playable(pd.read_parquet(features_path(tour))))
+    frames = [_playable(pd.read_parquet(features_path(t))) for t in TOURS]
     df = pd.concat(frames, ignore_index=True)
     # `seq` is assigned per tour, so it cannot order a pooled frame; the date
     # can. Sorting by seq here would interleave two tours' counters and put
@@ -237,12 +246,20 @@ def train_production_models(tour: str = "pooled") -> dict:
     win_feats = list(FEATURE_COLS)
     reg_feats = list(FEATURE_COLS) + abs_cols
 
-    cut = int(len(df) * 0.9)
+    # Same 85/15 split the backtest measures, so production is the setup that
+    # was evaluated. The calibrator is fitted on the held-out tail against a
+    # model that has not seen it; the *served* winner model is then refit on
+    # every row. Fitting only the first 90% left the model blind to the last
+    # 2+ years (it stopped at 2024-07) while the calibrator was the only thing
+    # that saw them.
+    cut = int(len(df) * 0.85)
     fit, cal = df.iloc[:cut], df.iloc[cut:]
-    m_win = _fit(WIN_PARAMS, fit, fit["y_win"].to_numpy(), win_feats,
+    m_cal = _fit(WIN_PARAMS, fit, fit["y_win"].to_numpy(), win_feats,
                  rounds=WIN_ROUNDS)
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.01, y_max=0.99)
-    iso.fit(m_win.predict(cal[win_feats]), cal["y_win"].to_numpy())
+    iso.fit(m_cal.predict(cal[win_feats]), cal["y_win"].to_numpy())
+    m_win = _fit(WIN_PARAMS, df, df["y_win"].to_numpy(), win_feats,
+                 rounds=WIN_ROUNDS)
 
     trt = df[df["y_total_games"].notna()]
     m_tot = _fit(REG_PARAMS, trt, trt["y_total_games"].to_numpy(), reg_feats)
