@@ -25,7 +25,7 @@ from sklearn.isotonic import IsotonicRegression
 
 from tennis.config import ARTIFACTS
 from tennis.db.schema import connect
-from tennis.features.pipeline import FEATURES_PATH
+from tennis.features.pipeline import features_path
 from tennis.models.common import (
     CATEGORICAL,
     FEATURE_COLS,
@@ -82,8 +82,32 @@ ABS_FEATURES = ["d_elo", "d_elo_surf", "d_rank", "d_log_rank", "d_serve_edge",
                 "d_spw", "d_rpw", "d_winrate_25", "d_h2h"]
 
 
-def load_features() -> pd.DataFrame:
-    df = pd.read_parquet(FEATURES_PATH)
+TOURS = ("atp", "wta")
+
+
+def load_features(tour: str = "pooled") -> pd.DataFrame:
+    """Features for one tour, or both pooled with `tour` as a model feature.
+
+    Pooled is the default because it was measured to be better, not assumed.
+    A model trained on both tours and given the `tour` column beats a WTA-only
+    model by 0.0044 log loss (95% CI [-0.0057, -0.0031], 14 of 15 walk-forward
+    seasons) and costs the ATP nothing measurable. The tours are genuinely
+    different -- 62.3% of serve points won against 56.1% -- but that argues for
+    letting the model *see* the difference, not for hiding half the data from
+    it. Ratings feeding these features stay strictly per tour; only the fit is
+    shared. See scripts/experiment_pooled_tour.py.
+
+    Rows are returned in global chronological order, so the walk-forward split
+    below cuts both tours at the same instant rather than by position.
+    """
+    if tour != "pooled":
+        return prepare(pd.read_parquet(features_path(tour)))
+    frames = [pd.read_parquet(features_path(t)) for t in TOURS]
+    df = pd.concat(frames, ignore_index=True)
+    # `seq` is assigned per tour, so it cannot order a pooled frame; the date
+    # can. Sorting by seq here would interleave two tours' counters and put
+    # 2026 WTA matches before 2005 ATP ones.
+    df = df.sort_values(["tourney_date", "tour", "seq"]).reset_index(drop=True)
     return prepare(df)
 
 
@@ -103,9 +127,11 @@ def _fit(params, X, y, feats, rounds=N_ROUNDS):
     return lgb.train(params, ds, num_boost_round=rounds)
 
 
-def run_backtest(start_season: int = 2010, run_tag: str = "wf_v1") -> dict:
+def run_backtest(start_season: int = 2010, run_tag: str | None = None,
+                 tour: str = "pooled") -> dict:
     t0 = time.time()
-    df = load_features()
+    run_tag = run_tag or f"wf_{tour}"
+    df = load_features(tour)
     df, abs_cols = add_abs(df)
     win_feats = list(FEATURE_COLS)
     reg_feats = list(FEATURE_COLS) + abs_cols
@@ -144,6 +170,9 @@ def run_backtest(start_season: int = 2010, run_tag: str = "wf_v1") -> dict:
             "season": season,
             "surface": te["surface"].astype(str).to_numpy(),
             "level": te["level"].astype(str).to_numpy(),
+            # Carried through so a pooled backtest can still be reported one
+            # tour at a time -- the fit is shared, the reporting is not.
+            "tour": te["tour"].astype(str).to_numpy(),
             "is_challenger": te["is_challenger"].to_numpy(),
             "p1_id": te["p1_id"].to_numpy(),
             "p2_id": te["p2_id"].to_numpy(),
@@ -161,15 +190,14 @@ def run_backtest(start_season: int = 2010, run_tag: str = "wf_v1") -> dict:
         log.info("  season %s: train=%d test=%d", season, len(tr), len(te))
 
     out = pd.concat(preds, ignore_index=True)
-    out.to_parquet(ARTIFACTS / "backtest.parquet", index=False)
+    out.to_parquet(ARTIFACTS / f"backtest_{tour}.parquet", index=False)
 
     con = connect()
     con.execute("DELETE FROM backtest WHERE run_tag=?", (run_tag,))
     cols = ["run_tag", "match_id", "seq", "tourney_date", "surface", "level",
             "is_challenger", "p1_id", "p2_id", "y_win", "p_win", "y_total",
-            "pred_total", "y_spread", "pred_spread"]
+            "pred_total", "y_spread", "pred_spread", "tour"]
     keep = out[cols].copy()
-    keep["tour"] = "atp"
     keep["close_p1"] = np.nan
     keep["close_p2"] = np.nan
     keep.to_sql("backtest", con, if_exists="append", index=False)
@@ -202,9 +230,9 @@ def summarize(out: pd.DataFrame, t0: float | None = None) -> dict:
     return res
 
 
-def train_production_models() -> dict:
+def train_production_models(tour: str = "pooled") -> dict:
     """Fit final models on all available history for live prediction."""
-    df = load_features()
+    df = load_features(tour)
     df, abs_cols = add_abs(df)
     win_feats = list(FEATURE_COLS)
     reg_feats = list(FEATURE_COLS) + abs_cols
@@ -222,29 +250,34 @@ def train_production_models() -> dict:
     m_spr = _fit(REG_PARAMS, trt, trt["y_spread"].to_numpy(), reg_feats)
 
     import pickle
-    with open(ARTIFACTS / "models.pkl", "wb") as fh:
+    with open(ARTIFACTS / f"models_{tour}.pkl", "wb") as fh:
         pickle.dump({
             "winner": m_win, "calibrator": iso, "totals": m_tot,
             "totals_sets": m_set, "spread": m_spr,
             "win_feats": win_feats, "reg_feats": reg_feats,
             "abs_features": ABS_FEATURES,
             "trained_through": int(df["tourney_date"].max()),
-            "n_train": len(df),
+            "n_train": len(df), "tour": tour,
         }, fh)
 
     imp = pd.DataFrame({
         "feature": m_win.feature_name(),
         "gain": m_win.feature_importance("gain"),
     }).sort_values("gain", ascending=False)
-    imp.to_csv(ARTIFACTS / "winner_feature_importance.csv", index=False)
-    return {"n_train": len(df), "top_features": imp.head(15).to_dict("records")}
+    imp.to_csv(ARTIFACTS / f"winner_feature_importance_{tour}.csv", index=False)
+    return {"tour": tour, "n_train": len(df),
+            "top_features": imp.head(15).to_dict("records")}
 
 
 if __name__ == "__main__":
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    res = run_backtest()
-    print(json.dumps(res, indent=2, default=str))
-    prod = train_production_models()
-    print("\nproduction models trained on", prod["n_train"], "rows")
-    for r in prod["top_features"][:12]:
-        print(f"  {r['feature']:<28} {r['gain']:,.0f}")
+    import sys
+    tours = [a.split("=", 1)[1] for a in sys.argv if a.startswith("--tour=")]
+    for t in (tours or ["pooled"]):
+        print(f"===== {t} =====")
+        res = run_backtest(tour=t)
+        print(json.dumps(res, indent=2, default=str))
+        prod = train_production_models(tour=t)
+        print(f"\nproduction models ({t}) trained on", prod["n_train"], "rows")
+        for r in prod["top_features"][:12]:
+            print(f"  {r['feature']:<28} {r['gain']:,.0f}")

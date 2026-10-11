@@ -499,9 +499,13 @@ def test_tourney_xref_prefers_the_right_event_not_the_biggest():
     con.execute("PRAGMA busy_timeout=60000")
     try:
         with exclusive_write("test_tourney_xref"):
+            # Scoped to the ATP. Loading the WTA made this name ambiguous:
+            # "Billie Jean King Cup qualifying round: Kazakhstan vs. Canada"
+            # also matches, and picking it would have the test resolve a feed
+            # id against a completely different event's players.
             canada = pd.read_sql(
                 "SELECT tourney_key, tourney_date FROM tournaments "
-                "WHERE season=2026 AND name LIKE '%Canada%'", con)
+                "WHERE season=2026 AND tour='atp' AND name LIKE '%Canada%'", con)
             if canada.empty:
                 pytest.skip("Canada Masters 2026 not loaded")
             key = canada.iloc[0]["tourney_key"]
@@ -1292,7 +1296,8 @@ def test_dedupe_fixtures_keys_on_the_pairing_not_the_date():
 
     # app.py runs Streamlit calls at import, so pull the function out by source
     src = open("dashboard/app.py").read()
-    start = src.index("def dedupe_fixtures")
+    # From _pair_key, which dedupe_fixtures now shares with drop_finished.
+    start = src.index("def _pair_key")
     end = src.index("@st.cache_data", start)
     ns: dict = {"pd": pd}
     exec(src[start:end], ns)
@@ -1413,3 +1418,368 @@ def test_single_instance_refuses_a_second_live_run(tmp_path, monkeypatch):
     with lockmod.single_instance("job"):
         pass
     assert not pf.exists()
+
+
+def test_tourney_meta_trusts_a_challenger_name_over_the_history():
+    """Level resolution needs both sources, and in this order.
+
+    Events currently in play are often absent from `tournaments` entirely --
+    that table is built from *results*, so a tournament being played right now
+    has no row yet. A name carrying "challenger" states its own level and is
+    trusted outright. Matching by name alone also mis-resolves: "Cincinnati
+    WTA" normalises onto the ATP Cincinnati Masters row.
+    """
+    import sqlite3
+
+    import pandas as pd
+
+    src = open("dashboard/app.py").read()
+    start = src.index("LEVEL_ORDER = {")
+    end = src.index("# Short TTL", start)
+    ns: dict = {"pd": pd}
+    exec(src[start:end], ns)
+
+    con = sqlite3.connect(":memory:")
+    con.execute("CREATE TABLE tournaments (name TEXT, level TEXT, "
+                "surface TEXT, season INT)")
+    con.executemany("INSERT INTO tournaments VALUES (?,?,?,?)", [
+        ("Cincinnati Masters", "masters", "Hard", 2026),
+        ("Winston Salem", "atp250", "Hard", 2025),
+        ("Prague 2", "challenger", "Clay", 2024),
+    ])
+    out = ns["_tourney_meta"](pd.Series([
+        "Cincinnati", "Winston Salem", "Prague 2 challenger",
+        "Sion challenger",          # absent from history entirely
+    ]), con).set_index("tournament")
+
+    assert out.loc["Cincinnati", "level"] == "masters"
+    assert out.loc["Winston Salem", "level"] == "atp250"
+    # Present in history *and* named challenger -- surface still comes through.
+    assert out.loc["Prague 2 challenger", "level"] == "challenger"
+    assert out.loc["Prague 2 challenger", "surface"] == "Clay"
+    # Absent from history: the name still settles the level.
+    assert out.loc["Sion challenger", "level"] == "challenger"
+
+    order = ns["LEVEL_ORDER"]
+    assert order["grand_slam"] < order["masters"] < order["atp250"] < order["challenger"]
+
+
+def test_no_undefined_names_anywhere():
+    """Catch the bug class that silently broke the nightly job for nine days.
+
+    A guard was added to `load_all` without importing it, so every run raised
+    `NameError: name 'exclusive_write' is not defined` -- after the download
+    step, so the logs looked busy and the failure was invisible until someone
+    asked why the data was stale. Nothing in the suite could catch it: the
+    function needs a database, and an import-time check does not evaluate
+    function bodies.
+
+    Only undefined names fail here. Unused imports are reported by pyflakes too
+    but are cosmetic, and failing on them would make this test noise that gets
+    disabled rather than a guard that gets trusted.
+    """
+    import subprocess
+    import sys
+
+    pyflakes = pytest.importorskip("pyflakes")     # noqa: F841
+    proc = subprocess.run(
+        [sys.executable, "-m", "pyflakes",
+         "tennis", "dashboard", "scripts", "tests"],
+        capture_output=True, text=True)
+    bad = [ln for ln in proc.stdout.splitlines() if "undefined name" in ln]
+    assert not bad, "undefined names:\n" + "\n".join(bad)
+
+
+def test_drop_finished_judges_the_fixture_not_the_row():
+    """A fixture seen finished once is finished, whatever other rows say.
+
+    Rows captured before the `status` column existed carry NULL. Treating NULL
+    as 'upcoming' row-by-row is what let played matches through: a finished
+    fixture still has its older NULL-status captures sitting in the table, and
+    those are precisely the rows a row-level filter keeps. Cincinnati's
+    Tiafoe-Musetti stayed on the betting screen at its pre-match price fourteen
+    hours after it ended.
+    """
+    import pandas as pd
+
+    src = open("dashboard/app.py").read()
+    start = src.index("def _pair_key")
+    end = src.index("def dedupe_fixtures", start)
+    ns: dict = {"pd": pd}
+    exec(src[start:end], ns)
+    drop_finished = ns["drop_finished"]
+
+    df = pd.DataFrame({
+        "p1_name": ["Tiafoe F.", "Musetti L.", "Fils A.", "Royer V."],
+        "p2_name": ["Musetti L.", "Tiafoe F.", "Cobolli F.", "Martinez P."],
+        # the older capture predates the column; the newer one knows
+        "status": [None, "finished", "upcoming", None],
+        "captured_at": ["2026-08-22T13:58", "2026-08-22T14:37",
+                        "2026-08-22T14:37", "2026-08-22T13:58"],
+    })
+    out = drop_finished(df)
+    # Both orientations of the finished fixture go, including the NULL row.
+    assert "Tiafoe F." not in set(out.p1_name) | set(out.p2_name)
+    # Genuinely upcoming fixtures survive, and so does an unknown-status one.
+    assert set(out.p1_name) == {"Fils A.", "Royer V."}
+    # No status column at all (an older database) must not blow up.
+    assert len(drop_finished(df.drop(columns="status"))) == 4
+
+
+def test_live_capture_fetches_tomorrow_as_well_as_today(monkeypatch):
+    """A night session past midnight is filed under the next day's page.
+
+    Cincinnati's semi-finals split across two pages: Cobolli-Fils at 19:30 on
+    the day's page, Nakashima-Tiafoe at 00:00 on the following one. Fetching
+    only today missed the second entirely, and would have gone on missing it
+    until the day it started.
+
+    Also pins the empty-page path: an unparseable or simply empty page yields a
+    frame with *no columns*, so touching df.p1_odds raises AttributeError
+    instead of returning zero. Tomorrow's page is routinely empty out of
+    season, which would have turned a quiet no-op into a crashing agent.
+    """
+    from datetime import date
+
+    from tennis.ingest import odds_live
+
+    asked = []
+
+    def fake_fetch(tour, day):
+        asked.append((tour, day))
+        return "<html></html>"          # parses to zero rows, no columns
+
+    monkeypatch.setattr(odds_live, "fetch", fake_fetch)
+    out = odds_live.capture(day=date(2026, 8, 22), tours=("atp",))
+
+    assert out == {"captured": 0}       # no crash on the empty parse
+    assert asked == [("atp", date(2026, 8, 22)), ("atp", date(2026, 8, 23))]
+
+
+def test_has_stats_does_not_require_service_game_counts():
+    """Serve rates need point counters, not SvGms, and the WTA proves why.
+
+    The WTA files carry no service-game counts at all before 2015, while their
+    point counters run back to the early 2000s. Requiring SvGms marked 19,846
+    WTA matches as statless and switched the feature builder off for fifteen
+    seasons of otherwise complete data. Hold % and break % genuinely need
+    SvGms and are guarded where they are computed, not here.
+    """
+    import pandas as pd
+
+    from tennis.ingest.load import clean
+
+    base = {
+        "tourney_id": "2010-1", "tourney_name": "Test", "surface": "Hard",
+        "draw_size": 32, "tourney_level": "I", "indoor": "O",
+        "tourney_date": 20100503, "match_num": 1, "round": "R32",
+        "best_of": 3, "score": "6-4 6-4", "minutes": 90,
+        "winner_id": "W1", "loser_id": "L1",
+        "winner_name": "A B", "loser_name": "C D",
+        "is_challenger_file": 0, "tour": "wta", "source_file": "2010_wta.csv",
+    }
+    stats = {"w_svpt": 70, "l_svpt": 68, "w_1stWon": 30, "l_1stWon": 28,
+             "w_2ndWon": 12, "l_2ndWon": 11}
+    # A pre-2015 WTA row: full point counters, no service-game counts at all.
+    row = {**base, **stats, "w_SvGms": None, "l_SvGms": None}
+    out = clean(pd.DataFrame([row]))
+    assert len(out) == 1
+    assert out.iloc[0]["has_stats"] == 1, "point counters alone must qualify"
+
+    # Missing point counters must still disqualify it.
+    bare = {**base, "w_svpt": None, "l_svpt": None, "w_1stWon": None,
+            "l_1stWon": None, "w_2ndWon": None, "l_2ndWon": None,
+            "w_SvGms": 10, "l_SvGms": 10}
+    assert clean(pd.DataFrame([bare])).iloc[0]["has_stats"] == 0
+
+
+@pytest.mark.needs_db
+def test_feature_state_is_scoped_per_tour():
+    """ATP and WTA must never share a rating pool.
+
+    They never play each other, so an Elo, a form window or a serve rate is
+    meaningful only inside its own tour. The two id namespaces happen to be
+    disjoint (WTA numeric, ATP alphanumeric), which would hide a pooling bug
+    rather than prevent one, so the split is made at the source and asserted
+    here instead of being left to that coincidence.
+    """
+    import pandas as pd
+
+    from tennis.features.pipeline import features_path
+
+    paths = {t: features_path(t) for t in ("atp", "wta")}
+    for t, p in paths.items():
+        if not p.exists():
+            pytest.skip(f"{p.name} not built")
+
+    frames = {t: pd.read_parquet(p) for t, p in paths.items()}
+    for t, f in frames.items():
+        assert set(f["tour"].unique()) == {t}, f"{t} features carry other tours"
+
+    ids = {t: set(f.p1_id) | set(f.p2_id) for t, f in frames.items()}
+    assert not (ids["atp"] & ids["wta"]), "a player appears on both tours"
+
+
+@pytest.mark.needs_db
+def test_tour_average_spw_differs_by_tour():
+    """The chain's anchor point is tour-specific, and materially so.
+
+    The ATP holds serve on ~62% of points and the WTA on ~56%. Because the
+    Markov chain amplifies away from this origin non-linearly, a pooled average
+    is not a harmless approximation -- it is wrong for both tours in the one
+    place every rating and probability is measured from.
+    """
+    from tennis.db.schema import connect
+    from tennis.models.markov import tour_average_spw
+
+    con = connect()
+    try:
+        atp = tour_average_spw(con, "atp")
+        wta = tour_average_spw(con, "wta")
+    finally:
+        con.close()
+    if not (0 < wta < 1) or not (0 < atp < 1):
+        pytest.skip("serve stats not loaded")
+    assert atp > wta + 0.03, f"expected a real gap, got atp={atp:.4f} wta={wta:.4f}"
+    assert 0.55 < atp < 0.70 and 0.50 < wta < 0.62
+
+
+def test_tour_is_a_model_feature_not_just_a_partition():
+    """The pooled fit needs `tour` as a real feature, and a categorical one.
+
+    Pooling without it would force one model to average over two tours that
+    hold serve at 62.3% and 56.1% -- a straw man that would lose to separate
+    models. With it, pooling beat a WTA-only fit by 0.0044 log loss across 14
+    of 15 walk-forward seasons and cost the ATP nothing.
+    """
+    from tennis.models.common import CATEGORICAL, FEATURE_COLS
+
+    assert "tour" in CATEGORICAL
+    assert "tour" in FEATURE_COLS
+
+
+def test_match_context_carries_a_tour():
+    """A prediction must state its tour, because the model asks for one."""
+    from tennis.models.predict import MatchContext
+
+    assert MatchContext().tour == "atp"
+    assert MatchContext(tour="wta").tour == "wta"
+
+
+@pytest.mark.needs_db
+def test_pooled_features_are_chronological_and_cover_both_tours():
+    """Pooled rows must be ordered by date, never by seq.
+
+    `seq` is assigned per tour, so it numbers two independent sequences. Sorting
+    a pooled frame by it interleaves those counters and would place 2026 WTA
+    matches before 2005 ATP ones -- which the walk-forward split would then
+    happily train on, leaking the future into every fold.
+    """
+    from tennis.features.pipeline import features_path
+    from tennis.models.train import load_features
+
+    for t in ("atp", "wta"):
+        if not features_path(t).exists():
+            pytest.skip(f"{t} features not built")
+
+    df = load_features("pooled")
+    assert set(df["tour"].unique()) == {"atp", "wta"}
+    dates = df["tourney_date"].to_numpy()
+    assert (dates[1:] >= dates[:-1]).all(), "pooled frame is not chronological"
+
+
+def test_seeded_positions_separate_the_top_seeds():
+    """The seeding order must keep the top seeds apart, round by round.
+
+    That separation is the entire point of a seeded draw: 1 and 2 cannot meet
+    before the final, the top four sit in four quarters, the top eight in eight
+    eighths.
+    """
+    from tennis.ingest.draws_api import seeded_positions
+
+    # Written the way a draw sheet is: 1 on the first line, 2 on the last.
+    assert seeded_positions(4) == [1, 4, 3, 2]
+    assert seeded_positions(64)[0] == 1 and seeded_positions(64)[-1] == 2
+    for n in (8, 16, 64):
+        order = seeded_positions(n)
+        assert sorted(order) == list(range(1, n + 1)), "not a permutation"
+        pos = {s: i for i, s in enumerate(order)}
+        for k in (2, 4, 8):
+            if k > n:
+                continue
+            sections = {pos[s] // (n // k) for s in range(1, k + 1)}
+            assert len(sections) == k, f"top {k} seeds share a section in a {n}-draw"
+
+
+def test_seed_ordering_fixes_the_bracket_without_touching_pairings():
+    """Reordering must rearrange ties, never repair or re-pair them.
+
+    The fixtures feed gives pairings in an arbitrary order, and the simulation
+    walks the bracket -- so that order decides every player's path. On the 2026
+    US Open feed it placed seeds 2 and 4 in the same quarter, a meeting that
+    cannot occur in any real draw.
+    """
+    import pandas as pd
+
+    from tennis.ingest.draws_api import order_fixtures_by_seed
+
+    # Eight ties, seeds deliberately in the wrong places.
+    fx = pd.DataFrame({
+        "p1_name": [f"Seed{i}" if i <= 4 else f"Player{i}" for i in range(1, 9)],
+        "p2_name": [f"Opp{i}" for i in range(1, 9)],
+        "seed1": [1, 2, 3, 4, None, None, None, None],
+        "seed2": [None] * 8,
+    })
+    out = order_fixtures_by_seed(fx)
+
+    assert len(out) == len(fx)
+    # Every tie survives intact -- same two players, still facing each other.
+    assert sorted(zip(fx.p1_name, fx.p2_name)) == sorted(zip(out.p1_name, out.p2_name))
+
+    pos = {int(r.seed1): i for i, r in enumerate(out.itertuples())
+           if pd.notna(r.seed1)}
+    assert pos[1] // 4 != pos[2] // 4, "seeds 1 and 2 must be in opposite halves"
+    assert len({pos[s] // 2 for s in (1, 2, 3, 4)}) == 4, "top 4 must be in 4 quarters"
+
+
+def test_seed_ordering_leaves_a_partial_draw_alone():
+    """A draw that is not a full power of two cannot be positioned meaningfully."""
+    import pandas as pd
+
+    from tennis.ingest.draws_api import order_fixtures_by_seed
+
+    fx = pd.DataFrame({"p1_name": ["a", "b", "c"], "p2_name": ["x", "y", "z"],
+                       "seed1": [1, None, None], "seed2": [None] * 3})
+    assert order_fixtures_by_seed(fx).equals(fx)
+    assert len(order_fixtures_by_seed(fx.iloc[:0])) == 0
+
+
+def test_tournament_draw_is_keyed_on_the_id_not_a_derived_slug():
+    """The draw lookup must use the numeric id, because a bad key is silent.
+
+    `tournament_slug` cut "National Bank Open - Montreal" down to "montreal",
+    which the endpoint matched, and "cincinnati" likewise -- so the approach
+    looked sound. "U.S. Open - New York" became "new-york", matched nothing,
+    and returned an empty sheet rather than an error. The page then fell back
+    to the fixtures feed, which carries pairings but no draw positions, and
+    rendered a confident bracket that disagreed with the official one.
+
+    Measured on the 2026 US Open: the id and the exact feed name each return
+    64 singles rows; "new-york", "us-open", "usopen", "flushing-meadows" and
+    "US Open" all return zero.
+    """
+    import inspect
+
+    from tennis.ingest import draws_api
+
+    sig = inspect.signature(draws_api.tournament_draw)
+    assert "key" in sig.parameters, "draw lookup should take a tournament key"
+
+    src = inspect.getsource(draws_api.tournament_draw)
+    assert "{key}" in src, "the request path must interpolate the key"
+
+    # The dashboard must pass the id through rather than re-deriving a slug.
+    app = open("dashboard/app.py").read()
+    assert "tournament_draw(draw_key" in app
+    assert "tournament_slug(str(row" not in app, \
+        "the draw key should no longer be derived from the tournament name"

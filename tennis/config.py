@@ -35,9 +35,10 @@ DB_PATH = DATA / "tennis.db"
 for _p in (RAW_TML, RAW_TD, ARTIFACTS):
     _p.mkdir(parents=True, exist_ok=True)
 
-# Scope: ATP only for now (main tour + challenger), 2000 onward.
+# Scope: ATP (main tour + challenger) and WTA (main tour only -- the source
+# publishes no WTA challenger/ITF tier), 2000 onward.
 START_YEAR = 2000
-TOURS = ("atp",)
+TOURS = ("atp", "wta")
 
 TML_API = "https://stats.tennismylife.org/api/data-files"
 TML_DATA = "https://stats.tennismylife.org/data"
@@ -47,6 +48,7 @@ TD_BASE = "http://www.tennis-data.co.uk"
 ONGOING_FILES = {
     "ongoing_tourneys.csv": "main",
     "challenger_ongoing_tourneys.csv": "challenger",
+    "wta_ongoing_tourneys.csv": "wta",
 }
 
 # --- Categorical standardisation -------------------------------------------
@@ -57,8 +59,26 @@ LEVEL_MAP = {
     "G": "grand_slam",     # Grand Slam
     "M": "masters",        # Masters 1000
     "F": "finals",         # Tour Finals
+    "1000": "masters",     # WTA 1000 -- the WTA files use the number where
+                           # the ATP files use "M" for the same tier
     "500": "atp500",
     "250": "atp250",
+    # The WTA has renamed its tiers twice, so a 27-year history speaks three
+    # vocabularies for the same ladder. Mapped onto the tokens above by
+    # equivalent standing, not by name:
+    #   2000-2008  Tier I..V
+    #   2009-2020  Premier Mandatory / Premier 5 / Premier / International
+    #   2021-      1000 / 500 / 250
+    # No code collides with an ATP one, so a single shared map is enough.
+    "T1": "masters",       # Tier I  -> today's 1000
+    "T2": "atp500",
+    "T3": "atp250",
+    "T4": "atp250",
+    "T5": "atp250",
+    "PM": "masters",       # Premier Mandatory
+    "P5": "masters",       # Premier 5
+    "P": "atp500",         # Premier
+    "I": "atp250",         # International
     "A": "atp250",         # legacy pre-2009 "ATP Tour" label
     "D": "davis_cup",
     "O": "olympics",

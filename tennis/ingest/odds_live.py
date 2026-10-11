@@ -29,7 +29,7 @@ from __future__ import annotations
 import logging
 import re
 import time
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 
 import pandas as pd
 import requests
@@ -123,6 +123,7 @@ def parse(html: str, tour: str, day: date) -> pd.DataFrame:
                             "tour": tour, "tournament": tournament,
                             "p1_name": _clean(p1), "p2_name": _clean(p2),
                             "p1_odds": o1, "p2_odds": o2,
+                            "status": _status(r, nxt),
                         })
                 i += 2
                 continue
@@ -139,6 +140,29 @@ def _time(raw: str) -> str | None:
     """'14:30 Live streams 1xBet' -> '14:30'. The cell carries ad copy."""
     m = re.match(r"\s*(\d{1,2}:\d{2})", raw or "")
     return m.group(1) if m else None
+
+
+def _status(row, nxt) -> str:
+    """'finished' once the site marks a winner, else 'upcoming'.
+
+    The day page lists everything scheduled for that date regardless of whether
+    it has been played, and the capture agent runs through the day, so roughly
+    half of what it collects at any moment is already over. Without this the
+    betting screen quoted a Cincinnati match that had finished fourteen hours
+    earlier, at its pre-match price, indistinguishable from a live one.
+
+    The marker is the same `coursew` class `_prices` has to work around: the
+    site relabels the winner's price cell only once there is a winner. A score
+    cell is the corroborating signal, since an unplayed match has none.
+    """
+    for r in (row, nxt):
+        for td in r.find_all("td"):
+            if "coursew" in set(td.get("class") or []):
+                return "finished"
+    score = row.find("td", class_="result")
+    if score and score.get_text(strip=True):
+        return "finished"
+    return "upcoming"
 
 
 def _prices(row) -> tuple[float | None, float | None]:
@@ -164,19 +188,38 @@ def _prices(row) -> tuple[float | None, float | None]:
     return vals[0], vals[1]
 
 
-def capture(day: date | None = None, tours=("atp", "wta")) -> dict:
-    """Scrape now and append to `odds_snapshots`. Safe to run repeatedly."""
+def capture(day: date | None = None, tours=("atp", "wta"),
+            days_ahead: int = 1) -> dict:
+    """Scrape now and append to `odds_snapshots`. Safe to run repeatedly.
+
+    Fetches tomorrow's page as well as today's. A night session that starts at
+    or after midnight in the site's own clock is filed under the *next* date
+    even though it belongs to tonight's play: the Cincinnati semi-final
+    Nakashima-Tiafoe was listed at 00:00 on the following day's page while the
+    other semi-final sat at 19:30 on today's. Fetching only today missed it
+    entirely, and would have kept missing it until the day it started. Costs
+    one extra request per tour, against a page that carries a handful of rows.
+    """
     day = day or datetime.now(timezone.utc).date()
+    days = [day + timedelta(days=i) for i in range(days_ahead + 1)]
     now = datetime.now(timezone.utc).isoformat(timespec="seconds")
     frames = []
     for t in tours:
-        try:
-            frames.append(parse(fetch(t, day), t, day))
-        except Exception as exc:
-            log.warning("%s capture failed: %s", t, exc)
+        for d in days:
+            try:
+                frames.append(parse(fetch(t, d), t, d))
+            except Exception as exc:
+                log.warning("%s capture failed for %s: %s", t, d, exc)
     if not frames:
         return {"captured": 0}
     df = pd.concat(frames, ignore_index=True)
+    # Check for rows before touching columns. An unparseable page yields a
+    # frame with no columns at all, so `df.p1_odds` raises AttributeError
+    # rather than returning nothing -- the agent would crash instead of
+    # logging a quiet zero. Now that tomorrow's page is fetched too, an empty
+    # parse is routine: out of season, or simply nothing scheduled yet.
+    if df.empty or "p1_odds" not in df.columns:
+        return {"captured": 0}
     df = df[df.p1_odds.notna() & df.p2_odds.notna()]
     if df.empty:
         return {"captured": 0}
@@ -184,7 +227,7 @@ def capture(day: date | None = None, tours=("atp", "wta")) -> dict:
 
     con = connect()
     cols = ["captured_at", "play_date", "start_time", "tour", "tournament",
-            "p1_name", "p2_name", "p1_odds", "p2_odds", "source"]
+            "p1_name", "p2_name", "p1_odds", "p2_odds", "source", "status"]
     con.executemany(
         f"INSERT OR REPLACE INTO odds_snapshots({','.join(cols)}) "
         f"VALUES ({','.join('?' * len(cols))})",

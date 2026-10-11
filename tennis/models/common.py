@@ -49,7 +49,14 @@ CONTEXT = [
     "h2h_p1", "h2h_p2", "h2h_n", "h2h_surf_p1", "h2h_surf_p2",
     "elo_prob", "elo_surf_prob", "log_p1_rank", "log_p2_rank",
 ]
-CATEGORICAL = ["surface", "level"]
+# `tour` is a feature, not just a partition. Measured on walk-forward folds,
+# a model pooled across both tours and given this column beats a WTA-only
+# model by 0.0044 log loss (95% CI [-0.0057, -0.0031], 14 of 15 seasons) and
+# costs the ATP nothing (-0.0005, CI spanning zero). The tours differ
+# structurally -- 62.3% of serve points won against 56.1% -- and this is what
+# lets one model represent that difference while still learning everything
+# that generalises across both. See scripts/experiment_pooled_tour.py.
+CATEGORICAL = ["surface", "level", "tour"]
 
 FEATURE_COLS: list[str] = (
     [f"p1_{c}" for c in PER_PLAYER]
@@ -68,6 +75,12 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     """Coerce dtypes so LightGBM sees numerics and proper categoricals."""
     out = df.copy()
     for c in CATEGORICAL:
+        # Tolerate an absent categorical the same way the numeric block does.
+        # A caller assembling a frame by hand will not always carry every
+        # context column, and crashing on the missing one is worse than
+        # letting the model see it as unknown.
+        if c not in out.columns:
+            out[c] = np.nan
         out[c] = out[c].astype("category")
     for c in FEATURE_COLS:
         if c in CATEGORICAL:

@@ -7,7 +7,7 @@ This module covers only the thin remaining slice: events about to start.
 
 What this feed actually provides, measured rather than assumed:
 
-* `/ms-api/tournament/{tour}/{slug}/{year}/draws` returns the **full draw sheet**
+* `/ms-api/tournament/{tour}/{id}/{year}/draws` returns the **full draw sheet**
   and is the endpoint to use. It includes players holding a first-round bye
   (marked `result == "bye"` against a sentinel opponent id 3700) and carries a
   `draw` field giving the true bracket position.
@@ -24,8 +24,13 @@ What this feed actually provides, measured rather than assumed:
 So this supports simulating an event the evening before it starts. It does not
 support simulating one a week out.
 
-Note the draws endpoint keys on a name *slug* ("montreal"), not the numeric
-tournament id used by every other endpoint here.
+The draws endpoint accepts either the numeric tournament id or a tournament's
+exact name. Use the id. A derived slug looked like it worked -- "National Bank
+Open - Montreal" cut down to "montreal" matched, and so did "cincinnati" --
+right up until "U.S. Open - New York" became "new-york", matched nothing, and
+returned an empty sheet. The page then fell back to the fixtures feed and drew
+a bracket with no real draw positions in it, which is a wrong bracket rather
+than a missing one.
 
 Responses paginate at 10 rows by default; `pageSize` is honoured, which is what
 keeps a large draw to a single request.
@@ -173,11 +178,13 @@ BYE_PLAYER_ID = 3700  # the feed's "Unknown Player" sentinel, used for byes
 
 
 def tournament_slug(name: str) -> str:
-    """Turn a feed tournament name into the slug the draws endpoint wants.
+    """Cut a feed tournament name down to a bare venue slug.
 
-    'National Bank Open - Montreal' -> 'montreal', 'Hagen Challenger' -> 'hagen'.
-    The advanced draws endpoint keys on this slug rather than the numeric id
-    used everywhere else in the API.
+    DEPRECATED for draw lookups: pass the numeric tournament id to
+    `tournament_draw` instead. This guesses, and its guesses are unfalsifiable
+    from the outside -- a wrong slug returns an empty sheet rather than an
+    error, so the failure surfaced as a silently wrong bracket. Retained only
+    because it still reads names for display.
     """
     n = name.split(" - ")[-1]
     for junk in (" Challenger", " Open", " Masters", " Cup", " Championships"):
@@ -185,7 +192,8 @@ def tournament_slug(name: str) -> str:
     return re.sub(r"[^a-z0-9]+", "-", norm_name(n)).strip("-")
 
 
-def tournament_draw(slug: str, year: int | None = None, tour: str = "atp") -> dict:
+def tournament_draw(key: str | int, year: int | None = None,
+                    tour: str = "atp") -> dict:
     """Full draw sheet for a tournament, byes included.
 
     This is the endpoint that actually solves bye handling. The fixtures feed
@@ -194,10 +202,22 @@ def tournament_draw(slug: str, year: int | None = None, tour: str = "atp") -> di
     removed all 32 of them. This one returns every draw slot, marks byes with
     `result == "bye"` against a sentinel opponent, and carries a `draw` field
     giving the true bracket position.
+
+    `key` should be the **numeric tournament id**. The endpoint also accepts a
+    tournament's exact name, which is why a hand-derived slug appeared to work
+    for a while: "National Bank Open - Montreal" was cut down to "montreal" and
+    matched, so did "cincinnati". "U.S. Open - New York" became "new-york",
+    matched nothing, and returned an empty sheet -- whereupon the page fell
+    back to the fixtures feed and drew a bracket with no real positions in it.
+    Measured on the 2026 US Open: the id and the full name each return 64
+    singles and 112 qualifying rows, while "new-york", "us-open", "usopen",
+    "flushing-meadows" and "US Open" all return nothing. The id is what the
+    rest of this module already carries, so there is nothing to derive and
+    nothing to guess wrong.
     """
     year = year or date.today().year
-    return _get(f"/ms-api/tournament/{tour}/{slug}/{year}/draws",
-                cache_as=f"draws_{tour}_{slug}_{year}", max_age_s=1800)
+    return _get(f"/ms-api/tournament/{tour}/{key}/{year}/draws",
+                cache_as=f"draws_{tour}_{key}_{year}", max_age_s=1800)
 
 
 def _reconcile_withdrawals(out: pd.DataFrame) -> pd.DataFrame:
@@ -734,18 +754,107 @@ def resolve_players(names: list[str], con=None) -> dict[str, str | None]:
     return out
 
 
+def seeded_positions(n_pairs: int) -> list[int]:
+    """Standard seeding order: `out[i]` is the seed belonging in tie `i`.
+
+    The classical power-of-two construction. Each round of the recursion
+    mirrors the bracket, which is what guarantees the separation property the
+    whole draw is built around: seeds 1 and 2 cannot meet before the final,
+    the top four are in four different quarters, the top eight in eight
+    different eighths, and so on.
+    """
+    order = [1, 2]
+    while len(order) < n_pairs:
+        m = len(order) * 2
+        order = [x for pair in ((o, m + 1 - o) for o in order) for x in pair]
+    order = order[:n_pairs]
+    # Mirror the bottom half so seed 2 sits on the last line rather than at the
+    # head of that half. Both arrangements separate the seeds identically -- it
+    # is the same bracket reflected -- but tennis draws are written with 1 at
+    # the top and 2 at the bottom, so this reads the way the official sheet
+    # does instead of inviting a spurious mismatch.
+    half = n_pairs // 2
+    return order[:half] + order[half:][::-1] if half else order
+
+
+def order_fixtures_by_seed(fixtures: pd.DataFrame) -> pd.DataFrame:
+    """Reorder first-round ties so seeds sit where a real draw puts them.
+
+    The fixtures feed publishes pairings without bracket positions, so the
+    order it returns is arbitrary. Left alone that is not merely untidy: the
+    simulation walks the bracket, so a wrong arrangement gives every player the
+    wrong *path*, and the feed's order routinely puts the top two seeds in the
+    same quarter -- something that cannot happen in any real draw.
+
+    Seeds are enough to fix the structure. Every tie carrying a seed is placed
+    at that seed's conventional position; unseeded ties fill what is left, in
+    feed order. Round-one pairings are never altered, only their arrangement.
+
+    This reconstructs a *valid* bracket, not necessarily *the* bracket. Within
+    each seed band the official assignment is drawn at random -- seeds 3 and 4
+    genuinely could occupy either middle quarter -- so halves may still be
+    swapped relative to the official sheet. Once the draw sheet is published it
+    carries real positions and takes precedence over this.
+    """
+    n = len(fixtures)
+    if n == 0 or (n & (n - 1)):        # only meaningful on a full bracket
+        return fixtures
+
+    def seed_of(row) -> int | None:
+        """The tie's seed, if it has one.
+
+        Via float, not int: a seed column holding NaN is float-typed, so the
+        values arrive as 1.0 and `int("1.0")` raises. The live feed happens to
+        send strings, so an int-only parse worked there and silently found no
+        seeds anywhere else -- leaving the draw in the arbitrary order this
+        function exists to replace, with nothing to show it had failed.
+        Entries like 'Q', 'WC' and 'LL' are not seeds and fall through.
+        """
+        for v in (row.seed1, row.seed2):
+            try:
+                s = int(float(str(v).strip()))
+            except (TypeError, ValueError):
+                continue
+            if s > 0:
+                return s
+        return None
+
+    want = seeded_positions(n)          # tie index -> seed that belongs there
+    slot_for_seed = {s: i for i, s in enumerate(want)}
+
+    placed: dict[int, object] = {}
+    leftover = []
+    for row in fixtures.itertuples():
+        s = seed_of(row)
+        idx = slot_for_seed.get(s) if s is not None else None
+        if idx is None or idx in placed:
+            leftover.append(row.Index)
+        else:
+            placed[idx] = row.Index
+
+    free = (i for i in range(n) if i not in placed)
+    for src, idx in zip(leftover, free):
+        placed[idx] = src
+    return fixtures.loc[[placed[i] for i in sorted(placed)]]
+
+
 def build_draw_from_fixtures(fixtures: pd.DataFrame, *, name: str, surface: str,
                              level: str, best_of: int = 3,
-                             indoor: float = 0.0, tourney_date: int | None = None):
+                             indoor: float = 0.0, tourney_date: int | None = None,
+                             use_seeds: bool = True):
     """Turn first-round fixtures into a simulator-ready Draw.
 
-    The feed gives pairings but not bracket position, so slots are laid out in
-    the order returned: fixture i occupies slots 2i and 2i+1. That is correct
-    for who-plays-whom in round 1 and for the shape of the bracket, but the
-    *order* of the halves may not match the official draw sheet.
+    The feed gives pairings but not bracket position. `order_fixtures_by_seed`
+    reconstructs the arrangement from the seeds, which fixes the structural
+    errors that matter to a bracket simulation; see its docstring for what that
+    can and cannot recover. Round-one pairings come straight from the feed
+    either way.
     """
     from tennis.models.predict import MatchContext
     from tennis.sim.bracket import Draw
+
+    if use_seeds:
+        fixtures = order_fixtures_by_seed(fixtures)
 
     names = sorted({*fixtures["p1_name"], *fixtures["p2_name"]})
     ids = resolve_players(names)

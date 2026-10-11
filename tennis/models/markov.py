@@ -197,10 +197,17 @@ def matchup_spw(serve_a: np.ndarray, return_b: np.ndarray,
     return np.clip(p, 0.30, 0.90)
 
 
-def tour_average_spw(con) -> float:
-    """Mean serve points won across the database, for the decomposition above."""
+def tour_average_spw(con, tour: str = "atp") -> float:
+    """Mean serve points won on one tour, for the decomposition above.
+
+    Scoped by tour, and it has to be: the ATP holds serve on 62.3% of points
+    and the WTA on 56.5%. A pooled average is wrong for both, and wrong in the
+    worst place -- it is the origin the whole chain is anchored to, so every
+    rating is measured as a deviation from it and every probability is
+    amplified away from it by the scoring structure.
+    """
     row = con.execute(
         "SELECT SUM(w_1stWon + w_2ndWon + l_1stWon + l_2ndWon) * 1.0 "
         "/ SUM(w_svpt + l_svpt) FROM matches "
-        "WHERE w_svpt > 0 AND l_svpt > 0").fetchone()
+        "WHERE w_svpt > 0 AND l_svpt > 0 AND tour = ?", (tour,)).fetchone()
     return float(row[0]) if row and row[0] else DEFAULT_SPW
