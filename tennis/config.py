@@ -29,10 +29,11 @@ _load_dotenv(ROOT / ".env")
 DATA = ROOT / "data"
 RAW_TML = DATA / "raw" / "tennismylife"
 RAW_TD = DATA / "raw" / "tennisdata"
+RAW_ONGOING_ARCHIVE = DATA / "raw" / "tennismylife_ongoing"
 ARTIFACTS = ROOT / "artifacts"
 DB_PATH = DATA / "tennis.db"
 
-for _p in (RAW_TML, RAW_TD, ARTIFACTS):
+for _p in (RAW_TML, RAW_TD, RAW_ONGOING_ARCHIVE, ARTIFACTS):
     _p.mkdir(parents=True, exist_ok=True)
 
 # Scope: ATP (main tour + challenger) and WTA (main tour only -- the source

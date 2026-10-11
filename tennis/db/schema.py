@@ -254,6 +254,26 @@ CREATE TABLE IF NOT EXISTS tourney_xref (
     resolved_at  TEXT
 );
 
+-- Maps the draw feed's own player id to ours. Recorded only for matches that
+-- were unambiguous, so a name the feed spells or orders differently from us
+-- is resolved once and then looked up by id.
+CREATE TABLE IF NOT EXISTS feed_player_xref (
+    feed_id     TEXT PRIMARY KEY,
+    tour        TEXT,
+    player_id   TEXT,
+    feed_name   TEXT,
+    resolved_at TEXT
+);
+
+-- Duplicate upstream player ids folded into one canonical id at load. Audit
+-- trail only; the merge itself happens in tennis/ingest/load.py.
+CREATE TABLE IF NOT EXISTS player_alias (
+    alias_id     TEXT PRIMARY KEY,
+    canonical_id TEXT NOT NULL,
+    tour         TEXT,
+    reason       TEXT
+);
+
 CREATE TABLE IF NOT EXISTS sim_results (
     draw_id   TEXT,
     run_at    TEXT,

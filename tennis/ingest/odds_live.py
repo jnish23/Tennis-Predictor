@@ -256,6 +256,12 @@ def resolve_snapshots(con=None) -> dict:
             con.close()
         return {"resolved": 0}
 
+    # A capture taken after the match was over is not a closing line: the page
+    # lists the day's finished matches with their final prices, and "last
+    # capture wins" would happily promote one. Captures that predate the
+    # status column (NULL) are kept; they were all taken before play.
+    snaps = snaps[snaps["status"].fillna("upcoming") != "finished"]
+
     # Last capture wins per fixture.
     snaps = snaps.sort_values("captured_at").drop_duplicates(
         subset=["play_date", "p1_name", "p2_name"], keep="last")
@@ -264,17 +270,22 @@ def resolve_snapshots(con=None) -> dict:
                          snaps.p2_name.map(surname_key))]
 
     m = pd.read_sql(
-        """SELECT m.match_id, m.tourney_date, pw.name w, pl.name l
+        """SELECT m.match_id, m.tourney_date, m.tour, pw.name w, pl.name l
            FROM matches m
            JOIN players pw ON pw.player_id = m.winner_id
            JOIN players pl ON pl.player_id = m.loser_id""", con)
     m["pair"] = [tuple(sorted(x)) for x in
                  zip(m.w.map(surname_key), m.l.map(surname_key))]
 
-    j = snaps.merge(m, on="pair", how="inner")
+    j = snaps.merge(m, on="pair", how="inner", suffixes=("", "_m"))
+    j = j[j["tour"].fillna(j["tour_m"]) == j["tour_m"]]
+    # tourney_date is the event START, and a match can be played up to ~two
+    # weeks after it (a Slam final is 14 days in). The window was +/-7 days,
+    # which left Slam QF/SF/F with no prices at all. One-sided now: the match
+    # is in the most recent event that began on or before the play date.
     j["gap"] = (pd.to_datetime(j.play_date.astype(str)) -
-                pd.to_datetime(j.tourney_date.astype(str))).dt.days.abs()
-    j = j[j.gap <= 7].sort_values("gap").drop_duplicates(subset=["match_id"])
+                pd.to_datetime(j.tourney_date.astype(str))).dt.days
+    j = j[j.gap.between(-1, 21)].sort_values("gap").drop_duplicates(subset=["match_id"])
 
     p1_is_winner = j.p1_name.map(surname_key) == j.w.map(surname_key)
     j["win_price"] = j.p1_odds.where(p1_is_winner, j.p2_odds)

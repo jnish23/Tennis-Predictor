@@ -20,7 +20,7 @@ import logging
 import time
 from datetime import datetime, timezone
 
-from tennis.config import ARTIFACTS
+from tennis.config import ARTIFACTS, TOURS
 from tennis.db.schema import connect, set_state
 from tennis.ingest.download import sync_tennisdata, sync_tennismylife
 from tennis.ingest.load import load_all
@@ -63,14 +63,21 @@ def run_daily(*, retrain: bool = False, full_history: bool = False) -> dict:
         log.warning("live odds capture failed: %s", exc)
         report["odds_live"] = {"error": str(exc)}
 
-    # 4. features, incrementally from saved engine state
+    # 4. features, incrementally from saved engine state, for every tour. The
+    # weekly (--retrain) run rebuilds in full instead: incremental state cannot
+    # see an upstream correction to a match it already folded in.
     from tennis.features.pipeline import run as build_feats
-    report["features"] = build_feats(full=False)
+    report["features"] = {t: build_feats(full=retrain, tour=t) for t in TOURS}
 
     if retrain:
+        from tennis.models import evaluate
         from tennis.models.train import run_backtest, train_production_models
         report["backtest"] = run_backtest()
         report["production"] = {"n_train": train_production_models()["n_train"]}
+        # The dashboard reads these reports; refreshing the backtest without
+        # them left it showing Aug 22 numbers beside an Oct 5 backtest.
+        report["reports"] = {t: evaluate.full_report(tour=t)["n_matches"]
+                             for t in TOURS}
 
     set_state(con, "last_daily_run", report["started"])
     con.commit()

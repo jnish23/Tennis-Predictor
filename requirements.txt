@@ -1,16 +1,21 @@
-pandas>=2.2
-numpy>=1.26
-lightgbm>=4.3
-scikit-learn>=1.4
-scipy>=1.12
-streamlit>=1.35
-plotly>=5.20
-openpyxl>=3.1
-xlrd>=2.0
-requests>=2.31
-beautifulsoup4>=4.12   # odds scrapers (tennisexplorer, checkbestodds)
-pyarrow>=15.0
-pytest>=8.0
-matplotlib>=3.8
-optuna>=4.0   # optional: Bayesian search in notebooks/model_analysis.py
-pyflakes
+# Pinned to the versions the models and tests were produced with. The pickled
+# LightGBM boosters are tied to the library version, and a pandas major bump
+# already changes behaviour (pandas 4 deprecations are warning today).
+# Upgrade deliberately: bump, retrain (`python -m tennis.models.train`), re-run
+# the tests.
+pandas==3.0.5
+numpy==2.5.1
+lightgbm==4.7.0
+scikit-learn==1.9.0
+scipy==1.18.0
+streamlit==1.60.0
+plotly==6.9.0
+openpyxl==3.1.5
+xlrd==2.0.2
+requests==2.34.2
+beautifulsoup4==4.15.0   # odds scrapers (tennisexplorer, checkbestodds)
+pyarrow==24.0.0
+pytest==9.1.1
+matplotlib==3.11.1
+optuna==4.9.0   # optional: Bayesian search in notebooks/model_analysis.py
+pyflakes==3.4.0

@@ -24,6 +24,7 @@ import json
 import logging
 import os
 import time
+import uuid
 from datetime import datetime, timezone
 
 from tennis.config import DATA
@@ -31,7 +32,11 @@ from tennis.config import DATA
 log = logging.getLogger(__name__)
 
 CLAIM = DATA / ".db-write-claim"
-STALE_AFTER = 1800.0     # seconds; a claim older than this is assumed dead
+# A claim from a LIVE process is honoured however old it is: a nightly run on a
+# laptop that sleeps mid-job can legitimately outlast any short cutoff, and the
+# old 30-minute one let a second writer clear a claim its owner still held.
+# This is only a backstop against a recycled pid keeping a dead claim alive.
+STALE_AFTER = 12 * 3600.0
 
 
 def _alive(pid: int) -> bool:
@@ -59,6 +64,32 @@ def _active_claim() -> dict | None:
     return c
 
 
+class LockTimeout(RuntimeError):
+    """Another writer still held the claim when we ran out of patience."""
+
+
+def _claim_atomically(what: str) -> str | None:
+    """Create the claim file iff none exists. Returns our token, else None.
+
+    The content is written to a private temp file and hard-linked into place:
+    `link` fails if the target exists, so two claimants cannot both win, and the
+    claim never appears half-written to a reader.
+    """
+    token = uuid.uuid4().hex
+    CLAIM.parent.mkdir(parents=True, exist_ok=True)
+    tmp = CLAIM.with_name(f".{CLAIM.name}.{os.getpid()}.{token[:8]}")
+    tmp.write_text(json.dumps({
+        "pid": os.getpid(), "what": what, "at": time.time(), "token": token,
+        "since": datetime.now(timezone.utc).isoformat(timespec="seconds")}))
+    try:
+        os.link(tmp, CLAIM)
+        return token
+    except FileExistsError:
+        return None
+    finally:
+        tmp.unlink(missing_ok=True)
+
+
 @contextlib.contextmanager
 def exclusive_write(what: str = "", *, wait: float = 300.0, poll: float = 2.0):
     """Claim the database for a short heavy write, waiting for any other claim.
@@ -66,18 +97,30 @@ def exclusive_write(what: str = "", *, wait: float = 300.0, poll: float = 2.0):
     Long-running writers yield at their next batch boundary, so the wait is
     normally one batch. Claiming does not itself block SQLite -- it asks nicely
     -- so a writer that ignores `should_yield` is unaffected.
+
+    If the claim cannot be had within `wait` this raises rather than taking it:
+    overwriting a live claim is exactly the race the claim exists to prevent.
     """
     deadline = time.time() + wait
-    while _active_claim() is not None and time.time() < deadline:
+    token = None
+    while True:
+        if _active_claim() is None:
+            token = _claim_atomically(what)
+            if token:
+                break
+        if time.time() >= deadline:
+            raise LockTimeout(f"database claim still held after {wait:.0f}s")
         time.sleep(poll)
-    CLAIM.parent.mkdir(parents=True, exist_ok=True)
-    CLAIM.write_text(json.dumps({
-        "pid": os.getpid(), "what": what, "at": time.time(),
-        "since": datetime.now(timezone.utc).isoformat(timespec="seconds")}))
     try:
         yield
     finally:
-        CLAIM.unlink(missing_ok=True)
+        # Release only our own claim. If it was cleared and re-taken while we
+        # worked, deleting "whatever claim exists" would free someone else's.
+        try:
+            if json.loads(CLAIM.read_text()).get("token") == token:
+                CLAIM.unlink(missing_ok=True)
+        except (FileNotFoundError, ValueError):
+            pass
 
 
 class AlreadyRunning(RuntimeError):

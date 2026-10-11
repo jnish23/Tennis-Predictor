@@ -40,17 +40,17 @@ jobs:
           pip install pytest
 
       - name: Run tests
-        run: pytest tests/ -q --no-header
-
-      - name: Fail if the data-free suite shrank
-        # Guards against the skip mechanism quietly swallowing the suite: if a
-        # future change makes a logic test depend on the database, the count
-        # drops and this catches it rather than CI staying green on less work.
+        # One run: the pass count is read from the same output, so the suite is
+        # not executed three times. It guards against the skip mechanism
+        # quietly swallowing the suite -- if a logic test comes to depend on
+        # the database, the count drops and this fails rather than CI staying
+        # green on less work.
+        shell: bash
         run: |
-          COUNT=$(pytest tests/ -q --no-header --collect-only 2>/dev/null | grep -c '::' || true)
-          RAN=$(pytest tests/ -q --no-header 2>&1 | grep -oE '[0-9]+ passed' | grep -oE '[0-9]+')
-          echo "collected $COUNT, ran $RAN without a database"
-          if [ "$RAN" -lt 40 ]; then
-            echo "::error::only $RAN tests ran without data (expected >=40)"
+          pytest tests/ -q --no-header | tee pytest.out
+          RAN=$(grep -oE '[0-9]+ passed' pytest.out | grep -oE '[0-9]+')
+          echo "ran $RAN without a database"
+          if [ "${RAN:-0}" -lt 40 ]; then
+            echo "::error::only ${RAN:-0} tests ran without data (expected >=40)"
             exit 1
           fi

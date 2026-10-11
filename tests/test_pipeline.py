@@ -147,7 +147,8 @@ def test_simulation_is_not_deterministic_chaining():
 # prediction coherence
 # --------------------------------------------------------------------------
 @pytest.mark.skipif(
-    not (__import__("tennis.config", fromlist=["ARTIFACTS"]).ARTIFACTS / "models.pkl").exists(),
+    not (__import__("tennis.config", fromlist=["ARTIFACTS"]).ARTIFACTS
+         / "models_pooled.pkl").exists(),
     reason="production models not trained",
 )
 @pytest.mark.needs_db
@@ -1662,7 +1663,8 @@ def test_match_context_carries_a_tour():
     """A prediction must state its tour, because the model asks for one."""
     from tennis.models.predict import MatchContext
 
-    assert MatchContext().tour == "atp"
+    # Unset means "whatever tour the Predictor holds" -- never a silent ATP.
+    assert MatchContext().tour is None
     assert MatchContext(tour="wta").tour == "wta"
 
 

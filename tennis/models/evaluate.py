@@ -159,14 +159,22 @@ def roi_by_season(df: pd.DataFrame, edge: float = 0.03) -> list[dict]:
 
 
 def _reference_line(df: pd.DataFrame, col: str) -> pd.Series:
-    """Naive prior-season reference line by (surface, best-of proxy, level).
+    """Naive prior-season reference line by (surface, level).
 
-    Uses only earlier seasons, so the reference itself never sees the future.
+    Uses only STRICTLY EARLIER seasons. The earlier version shifted one row in a
+    date-sorted frame, which -- every match in an event sharing one date -- let
+    a row's line include other matches of its own event, in an arbitrary order.
     """
-    d = df.sort_values("tourney_date").copy()
-    grp = d.groupby(["surface", "is_challenger"])[col]
-    # expanding mean shifted by one row = average of everything strictly before
-    return grp.transform(lambda s: s.shift(1).expanding(min_periods=50).mean())
+    d = df[["surface", "is_challenger", "tourney_date", col]].copy()
+    d["season"] = d["tourney_date"] // 10000
+    g = (d.groupby(["surface", "is_challenger", "season"], observed=True)[col]
+           .agg(["sum", "count"]).reset_index().sort_values("season"))
+    keys = ["surface", "is_challenger"]
+    g["cum_sum"] = g.groupby(keys, observed=True)["sum"].cumsum() - g["sum"]
+    g["cum_n"] = g.groupby(keys, observed=True)["count"].cumsum() - g["count"]
+    g["line"] = (g["cum_sum"] / g["cum_n"]).where(g["cum_n"] >= 50)
+    out = d.merge(g[keys + ["season", "line"]], on=keys + ["season"], how="left")
+    return pd.Series(out["line"].to_numpy(), index=df.index)
 
 
 def roi_synthetic(df: pd.DataFrame, y_col: str, pred_col: str,
@@ -244,6 +252,38 @@ def breakout(bt: pd.DataFrame, by: str) -> pd.DataFrame:
                 s["y_spread"].to_numpy(), s["pred_spread"].to_numpy())["mae"] if len(s) > 30 else np.nan,
         })
     return pd.DataFrame(rows).sort_values("n", ascending=False)
+
+
+def _verdict(rep: dict, best_roi: float, beats_close: bool | None) -> str:
+    """One-paragraph reading of the numbers in `rep`, written from the numbers.
+
+    This was a fixed string asserting "loses money at every edge" whatever the
+    run found, so a profitable or a worse-than-Elo run would still have been
+    published with the same sentence.
+    """
+    ms = rep["market_subset"]
+    if not ms.get("n"):
+        return "No priced matches joined; ROI not computable this run."
+    ll, base = rep["winner"]["log_loss"], rep["winner_elo_baseline"]["log_loss"]
+    parts = [("Model is more accurate than an Elo-only baseline"
+              if ll < base else "Model is NOT more accurate than an Elo-only baseline")
+             + f" (log loss {ll:.4f} vs {base:.4f})"]
+    if beats_close is not None:
+        m = ms["market_closing"]["log_loss"]
+        parts.append(("and beats" if beats_close else "and is less accurate than")
+                     + f" the closing line on priced matches ({ms['model']['log_loss']:.4f}"
+                       f" vs {m:.4f}).")
+    rois = {k: v["roi_pct"] for k, v in rep["roi_winner"].items() if v.get("bets")}
+    if rois and np.isfinite(best_roi):
+        if best_roi > 0:
+            k = max(rois, key=rois.get)
+            parts.append(f"Flat-staking against that line returned {best_roi:+.2f}% at "
+                         f"{k.replace('_', ' ')} (best of {len(rois)} thresholds); check the "
+                         "per-season table before trusting it.")
+        else:
+            parts.append("Flat-staking against that line loses money at every edge "
+                         f"threshold tested (best {best_roi:.2f}%).")
+    return " ".join(parts)
 
 
 def full_report(book: str = "PS", tour: str = "atp") -> dict:
@@ -328,14 +368,7 @@ def full_report(book: str = "PS", tour: str = "atp") -> dict:
         "winner_beats_elo_baseline": rep["winner"]["log_loss"] < rep["winner_elo_baseline"]["log_loss"],
         "winner_beats_closing_line": beats_close,
         "best_winner_roi_pct": best_roi,
-        "verdict": ("No priced matches joined; ROI not computable this run."
-                    if not ms.get("n") else
-            "Model is more accurate than an Elo-only baseline but less accurate "
-            "than the Pinnacle closing line, and flat-staking it against that "
-            f"line loses money at every edge threshold tested (best {best_roi:.2f}%). "
-            "Treat it as a calibrated probability source, not a betting edge "
-            "against sharp closing prices."
-        ),
+        "verdict": _verdict(rep, best_roi, beats_close),
         "totals_spread_roi": (
             "Not computable against a market: the free data has no totals or "
             "handicap lines. Only a synthetic-line signal check is reported."

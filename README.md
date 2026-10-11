@@ -1,7 +1,8 @@
-# ATP Tennis Prediction System
+# Tennis Prediction System
 
 Win-probability, totals and spread models for ATP main tour and Challenger
-matches, 2000–present, with walk-forward backtesting, Monte Carlo bracket
+matches and WTA main tour matches, 2000–present (one LightGBM fit across both
+tours with `tour` as a feature; ratings and form are kept strictly per tour), with walk-forward backtesting, Monte Carlo bracket
 simulation, a nightly ingestion job and a Streamlit dashboard.
 
 Architecture follows the NBA system described in CLAUDE.md: LightGBM,
@@ -26,24 +27,24 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## What the numbers say
 
-Walk-forward over 2010–2026, 125,557 matches, each season predicted by a model
+Walk-forward over 2010–2026, 127,132 ATP matches, each season predicted by a model
 trained only on earlier matches.
 
 | | value |
 |---|---|
-| Log loss | **0.6053** (Elo-only baseline 0.6268) |
-| Brier | **0.2097** |
-| Accuracy | **66.5%** |
-| Totals MAE | **5.17 games** |
-| Spread MAE | **4.10 games** |
+| Log loss | **0.6047** (Elo-only baseline 0.6263) |
+| Brier | **0.2094** |
+| Accuracy | **66.4%** |
+| Totals MAE | **5.16 games** |
+| Spread MAE | **4.09 games** |
 | Total-sets MAE | 0.47 sets |
 
 Calibration is close to the diagonal across the full probability range.
 
-**The model does not beat the closing line.** On the 38,666 matches with
-Pinnacle prices, the closing line's log loss is 0.5736 against the model's
-0.5872, and flat-staking every positive-EV bet loses money at every edge
-threshold tested (best −2.80%, worst −4.25%; fractional Kelly −2.84%). Split by
+**The model does not beat the closing line.** On the 38,422 matches with
+Pinnacle prices, the closing line's log loss is 0.5730 against the model's
+0.5859, and flat-staking every positive-EV bet loses money at every edge
+threshold tested (best −3.06%, worst −4.00%). Split by
 season, 2 of 16 full seasons are profitable (best 2017, +8.3%; worst 2023,
 −14.0%). This is the expected result — tennis closing lines are sharp — and it
 is the honest headline: treat this as a calibrated probability source, not a
@@ -671,18 +672,25 @@ a migration. WTA files exist upstream (1990–2026) but are deferred per CLAUDE.
 because the maintainer describes them as less reliable than the ATP data.
 
 **Feature updates are incremental.** The engine pickles its running state, and
-the nightly job replays only new matches against it. A test asserts the
-incremental path reproduces a full recompute bit-for-bit.
+the nightly job replays only new matches against it. "New" is decided by
+`match_id`, never by `seq`: the reload renumbers `seq` every night, and
+`match_id` (`tourney_key-round-winner-loser`) deliberately excludes `match_num`,
+which upstream renumbers when a match moves from the ongoing file to the yearly
+one. If a match already folded into the state has since disappeared, or a new
+match pre-dates the state, the run rebuilds that tour in full instead; the
+weekly `--retrain` run always does. Tests assert the incremental path reproduces
+a full recompute across a reload.
 
 ## Nightly job
 
 ```bash
-./scripts/daily.sh              # fetch, reload, extend features (~40s)
-./scripts/daily.sh --retrain    # also refit models and rerun the backtest
+./scripts/daily.sh              # fetch, reload, extend both tours' features (a minute or two of compute)
+./scripts/daily.sh --retrain    # full feature rebuild, refit, backtest, reports
 ```
 
-The match table is fully reloaded each run rather than upserted. It takes ~25s
-for 200k rows and it is the only way upstream corrections — fixed scores,
+The match table is fully reloaded each run rather than upserted, in a single
+transaction (a failure rolls back to the previous tables; a source that shrinks
+by more than 10% is refused). It takes ~25s for 275k rows and it is the only way upstream corrections — fixed scores,
 backfilled stats — actually reach us. Feature computation is the part that is
 incremental. Retraining is weekly, not daily: one day of matches cannot move a
 model fit on 200k rows.
@@ -803,7 +811,10 @@ says so rather than letting a lucky draw get adopted.
 .venv/bin/python -m pytest tests/ -q
 ```
 
-40 tests: leakage guards, score-parser edge cases (retirements, walkovers,
-defaults, tiebreaks, malformed scores), simulator invariants, prediction
-symmetry, incremental-vs-full equivalence, and draw reconstruction (including a
-regression guard on the 99.3% recovery rate).
+Leakage guards, score-parser edge cases (retirements, walkovers, defaults,
+tiebreaks incl. match tiebreaks, malformed scores), simulator invariants,
+prediction symmetry, incremental-vs-full equivalence across a database reload,
+id stability, atomic reload, feed-name resolution (either name order, per tour),
+locking, and draw reconstruction (including a regression guard on the 99.3%
+recovery rate). Tests marked `needs_db` skip on a checkout without the
+database; CI requires at least 40 to run without it.

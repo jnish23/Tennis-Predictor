@@ -7,7 +7,9 @@ code. Anything else invites the two paths to drift apart silently.
 from __future__ import annotations
 
 import pickle
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, replace
+from datetime import date, timedelta
 
 import numpy as np
 import pandas as pd
@@ -16,6 +18,19 @@ from tennis.config import ARTIFACTS
 from tennis.db.schema import connect
 from tennis.features.build import FeatureEngine
 from tennis.models.common import CATEGORICAL, prepare
+
+
+def event_week_start(today: date | None = None) -> int:
+    """Monday of the current week, as YYYYMMDD.
+
+    Training stamps every match in an event with the week it began, so rest days
+    and the 14/30-day match counts are measured *from the event start*. A live
+    prediction dated "today" measures them from a different origin and shifts
+    every rest feature the model was trained on. Defaulting to the week's
+    Monday keeps the two on the same footing.
+    """
+    d = today or date.today()
+    return int((d - timedelta(days=d.weekday())).strftime("%Y%m%d"))
 
 
 @dataclass
@@ -27,13 +42,24 @@ class MatchContext:
     round: str = "R32"
     round_idx: float = 5.0
     draw_size: float = 32.0
-    tourney_date: int = 20260803
+    # Event start (YYYYMMDD), the origin training measures rest from. None
+    # means "this week" -- never a hard-coded date: a frozen default made every
+    # active player look 65 days rested and played 0 matches in 14 days.
+    tourney_date: int | None = None
     is_challenger: int = 0
     # The production model is fitted across both tours with `tour` as a
-    # feature, so a prediction has to say which one it is for. Defaulting to
-    # ATP keeps every existing caller correct rather than silently asking a
-    # pooled model to guess.
-    tour: str = "atp"
+    # feature, so a prediction has to say which one it is for. None defers to
+    # the Predictor's own tour, which is the only one whose rating state it
+    # holds; a context that names a different tour is an error, not a hint.
+    tour: str | None = None
+    # Seeds by player id. The draw sheet has them and training saw real seeds,
+    # so leaving them NaN at serve time was a train/serve skew.
+    seeds: dict | None = None
+
+
+# A 128-player matrix is 128x128 floats; a handful of contexts is plenty and an
+# unbounded dict in a long-running dashboard is not.
+_MATRIX_CACHE_MAX = 16
 
 
 class Predictor:
@@ -79,7 +105,7 @@ class Predictor:
             ).dropna().sort_values("tourney_date").groupby("pid").last()
             con.close()
         self.players = players.set_index("player_id")
-        self._matrix_cache: dict = {}
+        self._matrix_cache: OrderedDict = OrderedDict()
 
     # -- helpers ----------------------------------------------------------
     def _attr(self, pid: str, col: str, default=np.nan):
@@ -102,9 +128,20 @@ class Predictor:
         years = (pd.Timestamp(str(date)) - pd.Timestamp(str(d0))).days / 365.25
         return float(row["age"]) + years
 
+    def resolve(self, ctx: MatchContext) -> MatchContext:
+        """Fill the context's tour and date; refuse a tour this engine isn't."""
+        if ctx.tour is not None and ctx.tour != self.tour:
+            raise ValueError(
+                f"context is for tour {ctx.tour!r} but this Predictor holds "
+                f"{self.tour!r} rating state")
+        return replace(ctx, tour=self.tour,
+                       tourney_date=ctx.tourney_date or event_week_start())
+
     def build_row(self, p1: str, p2: str, ctx: MatchContext) -> dict:
+        ctx = self.resolve(ctx)
         r1, rp1 = self._rank(p1)
         r2, rp2 = self._rank(p2)
+        seeds = ctx.seeds or {}
         synth = {
             "match_id": f"pred-{p1}-{p2}-{ctx.tourney_date}",
             "seq": -1,
@@ -120,7 +157,8 @@ class Predictor:
             "loser_age": self._age(p2, ctx.tourney_date),
             "winner_ht": self._attr(p1, "height_cm"),
             "loser_ht": self._attr(p2, "height_cm"),
-            "winner_seed": np.nan, "loser_seed": np.nan,
+            "winner_seed": seeds.get(p1, np.nan),
+            "loser_seed": seeds.get(p2, np.nan),
             "winner_hand": self._attr(p1, "hand"), "loser_hand": self._attr(p2, "hand"),
         }
         row = self.engine.features_for(synth, force_winner_first=True)
@@ -213,10 +251,14 @@ class Predictor:
         # draw from successive rounds, or re-running with a different sim count.
         # The result depends only on the player set, the context and this
         # Predictor's frozen state, so it is safe to memoise.
+        ctx = self.resolve(ctx)
         key = (tuple(player_ids), ctx.surface, ctx.level, ctx.best_of,
-               ctx.indoor, ctx.draw_size, ctx.tourney_date, ctx.is_challenger)
+               ctx.indoor, ctx.draw_size, ctx.tourney_date, ctx.is_challenger,
+               ctx.round_idx, ctx.tour,
+               tuple(sorted((ctx.seeds or {}).items())))
         cached = self._matrix_cache.get(key)
         if cached is not None:
+            self._matrix_cache.move_to_end(key)
             return cached.copy()
 
         # Only unordered pairs: predict_many already averages both orientations,
@@ -232,4 +274,6 @@ class Predictor:
                 mat[idx[b], idx[a]] = 1.0 - p
         np.fill_diagonal(mat, 0.5)
         self._matrix_cache[key] = mat
+        while len(self._matrix_cache) > _MATRIX_CACHE_MAX:
+            self._matrix_cache.popitem(last=False)
         return mat.copy()
