@@ -1477,7 +1477,13 @@ def _mode_live(n_sims: int) -> None:
         "It does **not** publish draws at ceremony time: an event eight weeks out "
         "returns nothing. Simulate the evening before, not a week ahead."
     )
-    if not os.getenv("RAPIDAPI_KEY"):
+    from tennis.ingest.draws_api import cache_only
+    if cache_only():
+        st.caption(
+            "Draws on this site are the daily snapshot (fetched shortly after "
+            "06:30 UTC for events starting within three days); visitors do not "
+            "call the provider.")
+    elif not os.getenv("RAPIDAPI_KEY"):
         st.warning(
             "`RAPIDAPI_KEY` is not set. Put it in a `.env` file at the repo root "
             "(already gitignored) or export it before starting Streamlit."
