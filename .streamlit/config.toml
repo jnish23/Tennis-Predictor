@@ -8,4 +8,4 @@ maxUploadSize = 1
 gatherUsageStats = false
 
 [theme]
-base = "light"
+base = "dark"
