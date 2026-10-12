@@ -116,3 +116,25 @@ def test_serve_ratings_shrink_thin_histories():
                 for i in range(2)]
     out = SR.fit(pd.DataFrame(lopsided), 0.62)
     assert abs(out.iloc[-1]["w_serve"]) < 0.05
+
+
+def test_set_from_match_round_trips_and_matches_the_worked_example():
+    from tennis.models.markov import (match_from_set, match_from_set_beta,
+                                      set_from_match, set_from_match_beta)
+    s = np.linspace(0.02, 0.98, 49)
+    for bo in (3, 5):
+        assert set_from_match(match_from_set(s, bo), bo) == pytest.approx(s, abs=1e-9)
+    # -250 match (71.4%) is a ~64.7% set favourite, i.e. about -183
+    s_fav = float(set_from_match(1 / 1.4, 3)[0])
+    assert s_fav == pytest.approx(0.647, abs=1e-3)
+    assert (s_fav / (1 - s_fav)) == pytest.approx(1.83, abs=0.02)
+    # kappa -> inf is independence. With the match price fixed, finite kappa
+    # (correlated sets) damps the match-level amplification, so the marginal
+    # set probability has to be higher.
+    m = np.array([0.7, 0.8])
+    assert set_from_match_beta(m, np.inf) == pytest.approx(set_from_match(m, 3), abs=1e-9)
+    assert (set_from_match_beta(m, 8.0) > set_from_match(m, 3)).all()
+    s0 = np.array([0.3, 0.55, 0.8])
+    for bo in (3, 5):
+        assert set_from_match_beta(match_from_set_beta(s0, 12.0, bo), 12.0, bo) \
+            == pytest.approx(s0, abs=1e-8)
