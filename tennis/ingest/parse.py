@@ -169,3 +169,26 @@ def score_sets(score: str | float | None) -> list[tuple[int, int, int | None]]:
         tb = int(m.group(3)) if m.group(3) is not None else None
         out.append((wg, lg, tb))
     return out
+
+
+def _set_complete(wg: int, lg: int) -> bool:
+    """A finished set, as opposed to the in-progress score a retirement leaves."""
+    hi, lo = max(wg, lg), min(wg, lg)
+    return hi >= 6 and (hi - lo >= 2 or (hi == 7 and lo == 6))
+
+
+def set_winners(score: str | float | None) -> list[int]:
+    """Per-set outcome as 1 if the *match winner* took the set, else 0.
+
+    Stops at the first set that is not demonstrably finished: "6-3 2-1 RET"
+    yields one set, not two, so a set-2 label is never invented from a game
+    score that was interrupted. Set markets settle on the set itself, so a
+    retirement later in the match does not void an earlier set -- which is why
+    this reads the score rather than the match `status`.
+    """
+    out: list[int] = []
+    for wg, lg, _ in score_sets(score):
+        if not _set_complete(wg, lg):
+            break
+        out.append(1 if wg > lg else 0)
+    return out

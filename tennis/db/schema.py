@@ -188,6 +188,52 @@ CREATE TABLE IF NOT EXISTS te_scrape_log (
     PRIMARY KEY (kind, key)
 );
 
+-- OddsPortal (OddsHarvester) set-level prices. A sibling of the tennisexplorer
+-- tables rather than rows in `odds_quotes`: that table's key is a te_id and it
+-- is 6 GB; set prices are two numbers per (match, book, set), and keeping them
+-- apart means a re-scrape can never disturb the totals/handicap research data.
+-- Orientation is pinned ONCE in `op_matches.home_is_winner`, like te_matches.
+CREATE TABLE IF NOT EXISTS op_matches (
+    op_id        TEXT PRIMARY KEY,   -- OddsPortal's match id (link fragment)
+    link         TEXT,
+    play_date    INTEGER,            -- YYYYMMDD, UTC kickoff
+    league       TEXT,
+    season       INTEGER,
+    home_name    TEXT,
+    away_name    TEXT,
+    home_sets    INTEGER,
+    away_sets    INTEGER,
+    partial      TEXT,               -- their set scores, as published
+    match_id     TEXT,               -- our match_id, NULL until resolved
+    home_is_winner INTEGER,
+    set1_agree   INTEGER,            -- 1 if their set-1 result matches ours
+    source_file  TEXT
+);
+CREATE INDEX IF NOT EXISTS ix_opm_date  ON op_matches(play_date);
+CREATE INDEX IF NOT EXISTS ix_opm_match ON op_matches(match_id);
+
+CREATE TABLE IF NOT EXISTS set_quotes (
+    op_id       TEXT NOT NULL,
+    book        TEXT NOT NULL,
+    period      INTEGER NOT NULL,    -- 1 = first set, 2 = second set
+    home_price  REAL,
+    away_price  REAL,
+    PRIMARY KEY (op_id, book, period)
+);
+CREATE INDEX IF NOT EXISTS ix_sq_op ON set_quotes(op_id);
+
+-- Scrape checkpoint, same contract as te_scrape_log: a unit is recorded the
+-- moment it lands and a restart skips it. kind='event', key='league|season|period'.
+CREATE TABLE IF NOT EXISTS op_scrape_log (
+    kind       TEXT NOT NULL,
+    key        TEXT NOT NULL,
+    status     TEXT NOT NULL,        -- ok | error
+    n_rows     INTEGER,
+    note       TEXT,
+    done_at    TEXT,
+    PRIMARY KEY (kind, key)
+);
+
 -- Rankings snapshots derived from match rows (rank at time of match).
 CREATE TABLE IF NOT EXISTS rankings (
     player_id  TEXT,

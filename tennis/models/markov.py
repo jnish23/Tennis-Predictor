@@ -179,6 +179,71 @@ def p_match(pa: np.ndarray | float, pb: np.ndarray | float,
     return np.clip(np.where(best_of >= 5, bo5, bo3), 0.0, 1.0)
 
 
+def match_from_set(s: np.ndarray | float, best_of: np.ndarray | int = 3) -> np.ndarray:
+    """P(match) from a per-set win probability, sets independent."""
+    s = np.asarray(s, dtype=float)
+    bo3 = s**2 * (3.0 - 2.0 * s)
+    bo5 = s**3 * (10.0 - 15.0 * s + 6.0 * s**2)
+    return np.clip(np.where(np.asarray(best_of) >= 5, bo5, bo3), 0.0, 1.0)
+
+
+def _bisect_increasing(f, target: np.ndarray, iters: int = 60) -> np.ndarray:
+    lo, hi = np.zeros_like(target), np.ones_like(target)
+    for _ in range(iters):
+        mid = 0.5 * (lo + hi)
+        up = f(mid) < target
+        lo, hi = np.where(up, mid, lo), np.where(up, hi, mid)
+    return 0.5 * (lo + hi)
+
+
+def set_from_match(m: np.ndarray | float, best_of: np.ndarray | int = 3) -> np.ndarray:
+    """Invert `match_from_set`: the per-set probability a match price implies.
+
+    Under independent sets a 71.4% best-of-three favourite is a ~64.5% set
+    favourite -- which is why a "-180 set" line against a "-250 match" line is
+    fair, not underpriced. Both polynomials are monotone on [0, 1], so bisection
+    is exact and vectorises over a whole frame.
+    """
+    m = np.atleast_1d(np.asarray(m, dtype=float))
+    bo = np.broadcast_to(np.asarray(best_of), m.shape)
+    return _bisect_increasing(lambda s: match_from_set(s, bo), m)
+
+
+def _beta_moment(n: int, s0: np.ndarray, kappa: float) -> np.ndarray:
+    """E[s^n] for s ~ Beta(kappa*s0, kappa*(1-s0)); kappa=inf is a point mass."""
+    if not np.isfinite(kappa):
+        return s0**n
+    a = kappa * s0
+    out = np.ones_like(s0)
+    for i in range(n):
+        out = out * (a + i) / (kappa + i)
+    return out
+
+
+def match_from_set_beta(s0: np.ndarray, kappa: float,
+                        best_of: np.ndarray | int = 3) -> np.ndarray:
+    """P(match) when the per-set probability is itself uncertain.
+
+    A match is not five independent coin flips at a known bias; the bias is
+    uncertain (surface, form, matchup), which makes sets positively correlated.
+    `kappa` is the Beta concentration: large means sets are independent, small
+    means the first set is highly informative about the rest.
+    """
+    s0 = np.asarray(s0, dtype=float)
+    m3 = 3 * _beta_moment(2, s0, kappa) - 2 * _beta_moment(3, s0, kappa)
+    m5 = (10 * _beta_moment(3, s0, kappa) - 15 * _beta_moment(4, s0, kappa)
+          + 6 * _beta_moment(5, s0, kappa))
+    return np.where(np.asarray(best_of) >= 5, m5, m3)
+
+
+def set_from_match_beta(m: np.ndarray, kappa: float,
+                        best_of: np.ndarray | int = 3) -> np.ndarray:
+    """Marginal set-1 win probability consistent with match price `m` and `kappa`."""
+    m = np.atleast_1d(np.asarray(m, dtype=float))
+    bo = np.broadcast_to(np.asarray(best_of), m.shape)
+    return _bisect_increasing(lambda s: match_from_set_beta(s, kappa, bo), m)
+
+
 def matchup_spw(serve_a: np.ndarray, return_b: np.ndarray,
                 avg: float = DEFAULT_SPW) -> np.ndarray:
     """Combine A's serve rate and B's return rate into A's point-win rate.
