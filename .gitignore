@@ -13,6 +13,10 @@ artifacts/
 # Stray/scratch data pulls. Same policy as data/ above: rebuildable, not versioned.
 tml-data/
 notebooks/*.csv
+notebooks/*.ipynb
 
 # Per-machine Claude Code permissions; not shared config.
 .claude/settings.local.json
+
+atp_1st_set.csv
+tennis_1st_set.json
