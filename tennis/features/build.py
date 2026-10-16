@@ -45,6 +45,7 @@ SHRINK_K = {"decider": 10.0, "tb": 10.0, "career": 20.0}
 SURF_SERVE_K = 15.0
 # Tournament speed is read from this many prior seasons at most.
 SPEED_YEARS = 5
+SPEED_YEARS_SHORT = 3        # trailing window for the tspeed3_* variants
 # Layout of a tournament-season bucket: aces and the serve points they are
 # counted over, points won on serve and serve points, games and sets, matches.
 _SPEED_FIELDS = ("ace", "ace_pts", "won", "svpt", "games", "sets", "n")
@@ -177,6 +178,9 @@ class PlayerState:
     surf_spw: dict = field(default_factory=dict)
     surf_rpw: dict = field(default_factory=dict)
     surf_stat_n: dict = field(default_factory=dict)
+    # the same, but relative to what each opponent usually concedes
+    surf_adj_spw: dict = field(default_factory=dict)
+    surf_adj_rpw: dict = field(default_factory=dict)
     # surface continuity
     last_surface: str = ""
     surf_streak: int = 0
@@ -266,6 +270,17 @@ class FeatureEngine:
                                    ("rpw_surf", st.surf_rpw, f["ew_rpw_slow"])):
             e = book.get(surface) if surface else None
             if e is None or e.get() != e.get():
+                f[key] = overall
+            else:
+                n = st.surf_stat_n.get(surface, 0)
+                w = n / (n + SURF_SERVE_K)
+                f[key] = w * e.get() + (1.0 - w) * overall
+        # ... and the opponent-adjusted version of both, by surface.
+        for key, book, overall in (
+                ("adj_spw_surf", st.surf_adj_spw, f["ew_adj_spw_slow"]),
+                ("adj_rpw_surf", st.surf_adj_rpw, f["ew_adj_rpw_slow"])):
+            e = book.get(surface) if surface else None
+            if e is None or e.get() != e.get() or overall != overall:
                 f[key] = overall
             else:
                 n = st.surf_stat_n.get(surface, 0)
@@ -376,7 +391,7 @@ class FeatureEngine:
                      "opp_elo_10", "decider_winrate", "tb_winrate",
                      "surf_streak", "decider_wr_s", "tb_wr_s", "career_wr_s",
                      "ew_adj_spw_slow", "ew_adj_rpw_slow", "spw_surf",
-                     "rpw_surf"):
+                     "rpw_surf", "adj_spw_surf", "adj_rpw_surf"):
             a, b = out.get(f"p1_{base}"), out.get(f"p2_{base}")
             out[f"d_{base}"] = (a - b) if (a is not None and b is not None
                                            and a == a and b == b) else np.nan
@@ -404,16 +419,23 @@ class FeatureEngine:
         """
         nan = np.nan
         out = {"tspeed_ace": nan, "tspeed_spw": nan, "tspeed_gps": nan,
-               "tspeed_n": 0}
+               "tspeed_n": 0, "tspeed3_spw": nan, "tspeed3_ace": nan}
         key = _tourney_key(row)
         years = self.speed.get((key, surface)) if key else None
         if not years:
             return out
         tot = [0.0] * len(_SPEED_FIELDS)
+        tot3 = [0.0] * len(_SPEED_FIELDS)
         for y in range(year - SPEED_YEARS, year):
             bucket = years.get(y)
             if bucket:
                 tot = [t + x for t, x in zip(tot, bucket)]
+                if y >= year - SPEED_YEARS_SHORT:
+                    tot3 = [t + x for t, x in zip(tot3, bucket)]
+        if tot3[3] > 0:
+            out["tspeed3_spw"] = tot3[2] / tot3[3]
+        if tot3[1] > 0:
+            out["tspeed3_ace"] = tot3[0] / tot3[1]
         ace, ace_pts, won, svpt, games, sets, n = tot
         if ace_pts > 0:
             out["tspeed_ace"] = ace / ace_pts
@@ -516,6 +538,12 @@ class FeatureEngine:
                         if opp_srv == opp_srv:
                             st_.ew_adj_rpw[k].push(st_.rpw[-1] - (1.0 - opp_srv))
                 if surface and st_.spw and st_.rpw:
+                    if opp_ret == opp_ret:
+                        st_.surf_adj_spw.setdefault(surface, _Ewma(EWMA_HALFLIVES["slow"])
+                                                    ).push(st_.spw[-1] - (1.0 - opp_ret))
+                    if opp_srv == opp_srv:
+                        st_.surf_adj_rpw.setdefault(surface, _Ewma(EWMA_HALFLIVES["slow"])
+                                                    ).push(st_.rpw[-1] - (1.0 - opp_srv))
                     st_.surf_spw.setdefault(surface, _Ewma(EWMA_HALFLIVES["slow"])
                                             ).push(st_.spw[-1])
                     st_.surf_rpw.setdefault(surface, _Ewma(EWMA_HALFLIVES["slow"])

@@ -71,6 +71,19 @@ SHRINK = [("decider_winrate", "decider_wr_s"), ("tb_winrate", "tb_wr_s"),
           ("career_winrate", "career_wr_s")]
 
 
+ADJSURF = both(["adj_spw_surf", "adj_rpw_surf"]) + ["d_adj_spw_surf", "d_adj_rpw_surf"]
+SPEED3 = ["tspeed3_spw", "tspeed3_ace", "x_spd_spw", "x_spd_ace", "x_spd_edge"]
+
+
+def speed_interactions(df):
+    """Court speed (trailing 3 seasons) times the serve gap it should amplify."""
+    df = df.copy()
+    df["x_spd_spw"] = df["tspeed3_spw"] * df["d_spw"]
+    df["x_spd_ace"] = df["tspeed3_ace"] * df["d_ace_rate"]
+    df["x_spd_edge"] = df["tspeed3_spw"] * df["d_serve_edge"]
+    return df
+
+
 def blank_best_of(df):
     df = df.copy()
     df["best_of"] = np.nan
@@ -89,6 +102,8 @@ VARIANTS = {
     "V5": dict(win=BASE + ADJ, reg=BASE + ADJ),
     "V6": dict(win=BASE + SURF, reg=BASE + SURF),
 }
+VARIANTS["V7"] = dict(win=BASE + ADJSURF, reg=BASE + ADJSURF)
+VARIANTS["V8"] = dict(win=BASE + SPEED3, reg=BASE + SPEED3, mod=speed_interactions)
 # Filled in once the runs are in, from the groups that helped.
 VARIANTS["ALL"] = dict(win=BASE, reg=BASE)
 
@@ -186,7 +201,7 @@ def report() -> None:
     rng = np.random.default_rng(0)
     have = {p.stem for p in OUT.glob("*.parquet")}
     plan = [("V0", "V1a"), ("V1a", "V1"), ("V0", "V1"), ("V1", "V2"), ("V1", "V3"),
-            ("V1", "V4"), ("V1", "V5"), ("V1", "V6"), ("V1", "ALL"), ("V0", "ALL")]
+            ("V1", "V4"), ("V1", "V5"), ("V1", "V6"), ("V1", "V7"), ("V1", "V8"), ("V1", "ALL"), ("V0", "ALL")]
     rows = []
     for a, b in plan:
         if a in have and b in have:
