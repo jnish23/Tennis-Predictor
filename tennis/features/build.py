@@ -12,12 +12,14 @@ model raw winner/loser columns would otherwise be a trivially perfect leak.
 """
 from __future__ import annotations
 
+import datetime as _dt
 import hashlib
 import logging
 import math
 import pickle
 from collections import defaultdict, deque
 from dataclasses import dataclass, field
+from functools import lru_cache
 from itertools import islice
 
 import numpy as np
@@ -25,6 +27,7 @@ import pandas as pd
 
 from tennis.config import ARTIFACTS
 from tennis.features.elo import EloBook
+from tennis.ingest.parse import tiebreaks_won
 
 log = logging.getLogger(__name__)
 
@@ -33,10 +36,26 @@ SURF_WINDOW = 25
 STAT_WINDOW = 25
 MAXLEN = 60  # longest window we ever read
 
+# Pseudo-observations of 0.5 added to a win rate before it is read. A player
+# with 1 tiebreak played and 1 won is not a 100% tiebreak player; the prior
+# says how many matches of evidence it takes to move off 0.5.
+SHRINK_K = {"decider": 10.0, "tb": 10.0, "career": 20.0}
+# Surface serve/return rates blend toward the all-surface figure by
+# n / (n + K), the way the surface Elo does.
+SURF_SERVE_K = 15.0
+# Tournament speed is read from this many prior seasons at most.
+SPEED_YEARS = 5
+# Layout of a tournament-season bucket: aces and the serve points they are
+# counted over, points won on serve and serve points, games and sets, matches.
+_SPEED_FIELDS = ("ace", "ace_pts", "won", "svpt", "games", "sets", "n")
 
+
+@lru_cache(maxsize=None)
 def _date_to_ord(d: int) -> int:
+    # A season has ~52 distinct tourney_dates and the loop calls this twice per
+    # match, so cache it; datetime.date is also ~10x cheaper than pd.Timestamp.
     y, m, dd = d // 10000, (d // 100) % 100, d % 100
-    return int(pd.Timestamp(year=y, month=max(m, 1), day=max(dd, 1)).toordinal())
+    return _dt.date(y, max(m, 1), max(dd, 1)).toordinal()
 
 
 def _side_is_winner_first(match_id: str) -> bool:
@@ -48,7 +67,22 @@ def _mean(dq, n=None):
         return np.nan
     # Walk the tail only; list(dq) copied the whole deque on every call.
     vals = list(islice(reversed(dq), n)) if n else dq
-    return float(np.mean(vals)) if len(vals) else np.nan
+    # Plain sum/len: np.mean's per-call array conversion dominated the build.
+    # NaN still propagates, as it did under np.mean.
+    return sum(vals) / len(vals) if len(vals) else np.nan
+
+
+def _shrunk(w, n, k):
+    """Win rate pulled toward 0.5 by k pseudo-observations (0.5 when n == 0)."""
+    return (w + 0.5 * k) / (n + k)
+
+
+def _tourney_key(row) -> str:
+    """Year-agnostic identity of a tournament, for the speed index."""
+    name = row.get("tourney_name")
+    if not isinstance(name, str) or not name:
+        return ""
+    return "".join(ch for ch in name.lower() if ch.isalnum())
 
 
 def _safe_div(a, b):
@@ -130,11 +164,19 @@ class PlayerState:
     # context: 70% of serve points against a weak field is not 70% against
     # the top ten, and the model cannot know that from the rate alone
     opp_elo: deque = field(default_factory=_dq)
-    # clutch: deciding sets and tiebreaks
+    # clutch: deciding sets and tiebreaks (tb_* count individual tiebreaks
+    # won and played, not matches that contained one)
     decider_w: int = 0
     decider_n: int = 0
     tb_w: int = 0
     tb_n: int = 0
+    # serve/return relative to what each opponent usually concedes
+    ew_adj_spw: dict = field(default_factory=_ewma_pair)
+    ew_adj_rpw: dict = field(default_factory=_ewma_pair)
+    # per-surface serve/return, {surface: _Ewma}, and matches-with-stats counts
+    surf_spw: dict = field(default_factory=dict)
+    surf_rpw: dict = field(default_factory=dict)
+    surf_stat_n: dict = field(default_factory=dict)
     # surface continuity
     last_surface: str = ""
     surf_streak: int = 0
@@ -149,6 +191,12 @@ class FeatureEngine:
         self.h2h: dict[tuple[str, str], int] = defaultdict(int)
         self.h2h_surf: dict[tuple[str, str, str], int] = defaultdict(int)
         self.last_seq: int = -1
+        # Overall ratings as they stood on the first day of the current season,
+        # {"start": YYYYMMDD, "ratings": {player_id: rating}}. Served so the
+        # dashboard need not replay history to show season-to-date movement.
+        self.season_snap: dict | None = None
+        # Tournament-edition aggregates, {(tourney, surface): {year: [...]}}.
+        self.speed: dict[tuple[str, str], dict[int, list]] = {}
 
     # -- reading -----------------------------------------------------------
     def _player_feats(self, pid: str, surface: str, date_ord: int) -> dict:
@@ -183,7 +231,7 @@ class FeatureEngine:
         # Total points won per point played: serve% and return% combined. Above
         # 1.0 means the player wins more points than they lose overall.
         f["serve_edge"] = _diff(f["spw"], 1.0 - f["rpw"]) if not (
-            pd.isna(f["spw"]) or pd.isna(f["rpw"])) else np.nan
+            f["spw"] != f["spw"] or f["rpw"] != f["rpw"]) else np.nan
 
         f["avg_games_per_set"] = _mean(st.games_per_set, STAT_WINDOW)
         f["avg_total_games"] = _mean(st.total_games, STAT_WINDOW)
@@ -205,6 +253,24 @@ class FeatureEngine:
         f["decider_n"] = st.decider_n
         f["tb_winrate"] = _safe_div(st.tb_w, st.tb_n)
         f["tb_n"] = st.tb_n
+        f["decider_wr_s"] = _shrunk(st.decider_w, st.decider_n, SHRINK_K["decider"])
+        f["tb_wr_s"] = _shrunk(st.tb_w, st.tb_n, SHRINK_K["tb"])
+        f["career_wr_s"] = _shrunk(st.career_w, st.career_n, SHRINK_K["career"])
+
+        # Serve/return over and above what the opposition normally concedes.
+        for k in EWMA_HALFLIVES:
+            f[f"ew_adj_spw_{k}"] = st.ew_adj_spw[k].get()
+            f[f"ew_adj_rpw_{k}"] = st.ew_adj_rpw[k].get()
+        # Surface-specific serve/return, blended toward the all-surface figure.
+        for key, book, overall in (("spw_surf", st.surf_spw, f["ew_spw_slow"]),
+                                   ("rpw_surf", st.surf_rpw, f["ew_rpw_slow"])):
+            e = book.get(surface) if surface else None
+            if e is None or e.get() != e.get():
+                f[key] = overall
+            else:
+                n = st.surf_stat_n.get(surface, 0)
+                w = n / (n + SURF_SERVE_K)
+                f[key] = w * e.get() + (1.0 - w) * overall
 
         # Matches played on this surface since the last switch. A player fresh
         # off a surface change is a different proposition from one mid-swing.
@@ -213,8 +279,9 @@ class FeatureEngine:
         f["rest_days"] = (date_ord - st.last_date) if st.last_date is not None else np.nan
         f["matches_14d"] = sum(1 for d in st.dates if 0 <= date_ord - d <= 14)
         f["matches_30d"] = sum(1 for d in st.dates if 0 <= date_ord - d <= 30)
-        f["minutes_14d"] = float(np.nansum(
-            [m for d, m in zip(st.dates, st.minutes) if 0 <= date_ord - d <= 14]
+        f["minutes_14d"] = float(sum(
+            m for d, m in zip(st.dates, st.minutes)
+            if 0 <= date_ord - d <= 14 and m == m
         )) if st.dates else np.nan
         return f
 
@@ -286,6 +353,17 @@ class FeatureEngine:
         out["level"] = row["level"]
         out["is_challenger"] = row["is_challenger"]
 
+        # Symmetric serve features: the totals and spread targets depend on how
+        # both players serve, not on which is called p1.
+        out["spw_sum"] = out["p1_spw"] + out["p2_spw"]
+        out["hold_prod"] = out["p1_hold_pct"] * out["p2_hold_pct"]
+        # Expected serve-point win rate for each server: their own rate and
+        # what the opposing returner typically concedes, averaged.
+        out["exp_serve_p1"] = (out["p1_spw"] + 1.0 - out["p2_rpw"]) / 2.0
+        out["exp_serve_p2"] = (out["p2_spw"] + 1.0 - out["p1_rpw"]) / 2.0
+        out["exp_serve_sum"] = out["exp_serve_p1"] + out["exp_serve_p2"]
+        out.update(self._speed_feats(row, surface, int(row["tourney_date"]) // 10000))
+
         # pairwise differences (the model's main signal)
         for base in ("elo", "elo_surf", "winrate_10", "winrate_25", "winrate_50",
                      "surf_winrate", "spw", "rpw", "hold_pct", "break_pct",
@@ -296,10 +374,12 @@ class FeatureEngine:
                      "ew_spw_slow", "ew_rpw_fast", "ew_rpw_slow",
                      "ew_margin_fast", "ew_margin_slow", "opp_elo_25",
                      "opp_elo_10", "decider_winrate", "tb_winrate",
-                     "surf_streak"):
+                     "surf_streak", "decider_wr_s", "tb_wr_s", "career_wr_s",
+                     "ew_adj_spw_slow", "ew_adj_rpw_slow", "spw_surf",
+                     "rpw_surf"):
             a, b = out.get(f"p1_{base}"), out.get(f"p2_{base}")
             out[f"d_{base}"] = (a - b) if (a is not None and b is not None
-                                           and not (pd.isna(a) or pd.isna(b))) else np.nan
+                                           and a == a and b == b) else np.nan
         out["d_rank"] = _diff(out.get("p1_rank"), out.get("p2_rank"))
         out["d_log_rank"] = _diff(out.get("log_p1_rank"), out.get("log_p2_rank"))
         out["d_rank_points"] = _diff(out.get("p1_rank_points"), out.get("p2_rank_points"))
@@ -309,8 +389,39 @@ class FeatureEngine:
         out["elo_prob"] = 1.0 / (1.0 + 10 ** ((out["p2_elo"] - out["p1_elo"]) / 400.0))
         out["elo_surf_prob"] = (
             1.0 / (1.0 + 10 ** ((out["p2_elo_surf"] - out["p1_elo_surf"]) / 400.0))
-            if not (pd.isna(out["p1_elo_surf"]) or pd.isna(out["p2_elo_surf"])) else np.nan
+            if not (out["p1_elo_surf"] != out["p1_elo_surf"]
+                    or out["p2_elo_surf"] != out["p2_elo_surf"]) else np.nan
         )
+        return out
+
+    def _speed_feats(self, row, surface: str, year: int) -> dict:
+        """How fast this tournament has played in previous seasons.
+
+        Strictly prior seasons (year < this match's year): the current
+        season's matches at the same event are already in the aggregates but
+        are never read, so a round-1 and a final see the same index and nothing
+        from the event itself can leak into it.
+        """
+        nan = np.nan
+        out = {"tspeed_ace": nan, "tspeed_spw": nan, "tspeed_gps": nan,
+               "tspeed_n": 0}
+        key = _tourney_key(row)
+        years = self.speed.get((key, surface)) if key else None
+        if not years:
+            return out
+        tot = [0.0] * len(_SPEED_FIELDS)
+        for y in range(year - SPEED_YEARS, year):
+            bucket = years.get(y)
+            if bucket:
+                tot = [t + x for t, x in zip(tot, bucket)]
+        ace, ace_pts, won, svpt, games, sets, n = tot
+        if ace_pts > 0:
+            out["tspeed_ace"] = ace / ace_pts
+        if svpt > 0:
+            out["tspeed_spw"] = won / svpt
+        if sets > 0:
+            out["tspeed_gps"] = games / sets
+        out["tspeed_n"] = n
         return out
 
     # -- writing -----------------------------------------------------------
@@ -376,16 +487,40 @@ class FeatureEngine:
             st.dates.append(date_ord)
             st.minutes.append(row["minutes"] if not pd.isna(row["minutes"]) else np.nan)
 
+        # Tiebreaks, from who took each 7-6 set. Counted for any match that
+        # was played, retirements included: a completed tiebreak is a real
+        # result whatever happened afterwards.
+        wtb, ltb = tiebreaks_won(row.get("score"))
+        if wtb or ltb:
+            sw.tb_w += wtb
+            sl.tb_w += ltb
+            sw.tb_n += wtb + ltb
+            sl.tb_n += wtb + ltb
+
         # Serve/return rates need real counters; skip when absent.
         if row["has_stats"] == 1:
+            # What each side was expected to concede, read before this match
+            # touches either EWMA: the opponent's state going in, not after.
+            w_ret, w_srv = sw.ew_rpw["slow"].get(), sw.ew_spw["slow"].get()
+            l_ret, l_srv = sl.ew_rpw["slow"].get(), sl.ew_spw["slow"].get()
             self._push_stats(sw, sl, row, w_side=True)
             self._push_stats(sl, sw, row, w_side=False)
-            for st_ in (sw, sl):
+            for st_, opp_ret, opp_srv in ((sw, l_ret, l_srv), (sl, w_ret, w_srv)):
                 for k in EWMA_HALFLIVES:
                     if st_.spw:
                         st_.ew_spw[k].push(st_.spw[-1])
+                        if opp_ret == opp_ret:
+                            st_.ew_adj_spw[k].push(st_.spw[-1] - (1.0 - opp_ret))
                     if st_.rpw:
                         st_.ew_rpw[k].push(st_.rpw[-1])
+                        if opp_srv == opp_srv:
+                            st_.ew_adj_rpw[k].push(st_.rpw[-1] - (1.0 - opp_srv))
+                if surface and st_.spw and st_.rpw:
+                    st_.surf_spw.setdefault(surface, _Ewma(EWMA_HALFLIVES["slow"])
+                                            ).push(st_.spw[-1])
+                    st_.surf_rpw.setdefault(surface, _Ewma(EWMA_HALFLIVES["slow"])
+                                            ).push(st_.rpw[-1])
+                    st_.surf_stat_n[surface] = st_.surf_stat_n.get(surface, 0) + 1
 
         # Totals/spread history only from cleanly completed matches, so a
         # retirement never depresses a player's games-per-set average.
@@ -407,12 +542,24 @@ class FeatureEngine:
                 sw.decider_w += 1
                 sw.decider_n += 1
                 sl.decider_n += 1
-            if row["tiebreaks"]:
-                # Attributed at match level, not per tiebreak: the source gives
-                # tiebreak counts but not who won each one.
-                sw.tb_w += 1
-                sw.tb_n += 1
-                sl.tb_n += 1
+
+        # Tournament speed. Stored per season; _speed_feats reads only earlier ones.
+        key = _tourney_key(row)
+        if key:
+            b = self.speed.setdefault((key, surface), {}).setdefault(
+                int(row["tourney_date"]) // 10000, [0.0] * len(_SPEED_FIELDS))
+            if row["has_stats"] == 1:
+                aces = row["w_ace"] + row["l_ace"]
+                if aces == aces:             # ace counts can be missing alone
+                    b[0] += aces
+                    b[1] += row["w_svpt"] + row["l_svpt"]
+                b[2] += (row["w_1stWon"] + row["w_2ndWon"]
+                         + row["l_1stWon"] + row["l_2ndWon"])
+                b[3] += row["w_svpt"] + row["l_svpt"]
+                b[6] += 1
+            if row["totals_usable"] == 1 and row["total_sets"]:
+                b[4] += row["total_games"]
+                b[5] += row["total_sets"]
 
         self.last_seq = max(self.last_seq, int(row["seq"]))
 
@@ -466,7 +613,8 @@ class FeatureEngine:
 
 
 def _diff(a, b):
-    if a is None or b is None or pd.isna(a) or pd.isna(b):
+    # x != x is the NaN test without pd.isna's dispatch cost, hot in the loop.
+    if a is None or b is None or a != a or b != b:
         return np.nan
     return a - b
 
@@ -478,24 +626,37 @@ REQUIRED = [
     "total_sets", "game_margin", "winner_rank", "loser_rank",
     "winner_rank_points", "loser_rank_points", "winner_age", "loser_age",
     "winner_ht", "loser_ht", "winner_seed", "loser_seed", "winner_hand",
-    "loser_hand", "w_svpt", "w_1stIn", "w_1stWon", "w_2ndWon", "w_SvGms",
+    "loser_hand", "score", "w_svpt", "w_1stIn", "w_1stWon", "w_2ndWon", "w_SvGms",
     "w_bpSaved", "w_bpFaced", "w_ace", "w_df", "l_svpt", "l_1stIn", "l_1stWon",
     "l_2ndWon", "l_SvGms", "l_bpSaved", "l_bpFaced", "l_ace", "l_df",
 ]
 
 
 def build_features(matches: pd.DataFrame, engine: FeatureEngine | None = None,
-                   *, emit_from_seq: int = -1) -> tuple[pd.DataFrame, FeatureEngine]:
+                   *, emit_from_seq: int = -1,
+                   snapshot_start: int | None = None) -> tuple[pd.DataFrame, FeatureEngine]:
     """Walk matches in order, emitting a feature row for each.
 
     `emit_from_seq` lets an incremental run replay history to warm the state
     without re-emitting rows it already stored.
+
+    `snapshot_start` (YYYYMMDD) records every player's overall rating at the
+    moment the walk first reaches a match on or after that date, i.e. the state
+    after all earlier matches and before any later one.
     """
     engine = engine or FeatureEngine()
     matches = matches.sort_values("seq")
     rows = matches.to_dict("records")
     out = []
+    want_snap = (snapshot_start is not None and (
+        engine.season_snap is None or engine.season_snap["start"] != snapshot_start))
     for i, row in enumerate(rows):
+        if want_snap and int(row["tourney_date"]) >= snapshot_start:
+            day0 = _date_to_ord(snapshot_start)
+            engine.season_snap = {"start": int(snapshot_start), "ratings": {
+                pid: engine.elo.get(pid, "overall", day0)
+                for pid in engine.elo.players()}}
+            want_snap = False
         if row["seq"] > emit_from_seq:
             out.append(engine.features_for(row))
         engine.update(row)

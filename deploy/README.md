@@ -31,6 +31,12 @@ files and ship as one download. Nothing is stored in git.
 
 1. Make the repository public (Actions minutes are unlimited for public repos).
 2. Add the repo secret `RAPIDAPI_KEY` (optional; without it draws are not prefetched).
+   Add the repo *variable* `APP_URL` (the `*.streamlit.app` address) once the app is
+   deployed: `keepalive.yml` uses it to wake a sleeping app with a headless browser
+   every 6 hours (a plain GET cannot), and re-enables the other scheduled workflows
+   so GitHub's 60-days-of-inactivity rule cannot switch them off. The re-enable
+   trick restarts that clock as far as the GitHub docs and similar keep-alive
+   tools indicate; it is not something this repo has been able to test yet.
 3. Seed the cloud with this machine's history, so it starts from your odds
    snapshots instead of from nothing:
 

@@ -921,15 +921,7 @@ def test_season_boundary_splits_next_gen_from_the_openers():
     has to land between them. An earlier version cut at 1 December and filed
     both Next Gen editions into the season they actually end.
     """
-    import importlib.util  # noqa: F401
-
-    # app.py runs Streamlit calls at import, so pull the function out by source
-    src = open("dashboard/app.py").read()
-    start = src.index("SEASON_CUT = ")
-    end = src.index("@st.cache_data", start)
-    ns: dict = {}
-    exec(src[start:end], ns)
-    season_start, season_label = ns["season_start"], ns["season_label"]
+    from tennis.features.elo import season_label, season_start
 
     # season-ENDING events stay with the season they close
     assert season_start(20241218) == 20231225   # Next Gen Finals 2024

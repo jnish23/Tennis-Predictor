@@ -22,6 +22,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from tennis.config import ARTIFACTS  # noqa: E402
 from tennis.db.schema import connect  # noqa: E402
+from tennis.features.elo import season_label  # noqa: E402
 from tennis.models.common import calibration_table  # noqa: E402
 
 st.set_page_config(page_title="Tennis Prediction Model", layout="wide",
@@ -37,25 +38,39 @@ def refresh_hosted_data() -> None:
     """On the public site, keep the local data no more than a few hours old.
 
     Only active when DATA_BUNDLE_URL is set; on a laptop the pipeline writes
-    the data and this does nothing. A refresh clears the Streamlit caches,
-    which would otherwise keep serving the previous bundle's ratings and models.
+    the data and this does nothing.
+
+    With a copy already on disk the page renders it immediately and the
+    download runs on a background thread; only a visitor with *nothing* on disk
+    waits for it. The thread swaps files but never touches Streamlit's caches
+    (they are not safe to clear from outside a script run). Instead every
+    rerun asks whether the bundle's `built_at` changed and clears them here,
+    so the new data is picked up on the first interaction after the swap.
     """
     url = os.environ.get("DATA_BUNDLE_URL")
     if not url:
         return
+    from tennis.config import DATA
     from tennis.ops import bundle
-    if not bundle.is_stale(BUNDLE_MAX_AGE_H):
-        return
-    try:
-        with st.spinner("Downloading the latest data (about 250 MB, first visit only)…"):
-            bundle.fetch_serve(url)
+
+    if bundle.is_stale(BUNDLE_MAX_AGE_H):
+        have_copy = bundle.local_meta() is not None and (DATA / "tennis.db").exists()
+        if have_copy:
+            bundle.start_background_fetch(url)
+        else:
+            try:
+                with st.spinner("Downloading the latest data (about 250 MB, first visit only)…"):
+                    bundle.fetch_serve(url)
+            except Exception as exc:  # noqa: BLE001 - show it, don't crash the page
+                st.error(f"No data available yet, and the download failed: {exc}")
+                st.stop()
+
+    if bundle.bundle_changed():
         st.cache_data.clear()
         st.cache_resource.clear()
-    except Exception as exc:  # noqa: BLE001 - show it, don't crash the page
-        if bundle.local_meta() is None:
-            st.error(f"No data available yet, and the download failed: {exc}")
-            st.stop()
-        st.warning(f"Could not refresh the data ({exc}); showing the previous copy.")
+    err = bundle.background_error()
+    if err:
+        st.sidebar.warning(f"Could not refresh the data ({err}); showing the previous copy.")
 
 
 def data_as_of() -> str:
@@ -278,39 +293,8 @@ def load_elo(tour: str = "atp") -> pd.DataFrame:
     return out.rename_axis(None, axis=1)
 
 
-SEASON_CUT = (12, 25)  # month, day
-
-
-def season_start(date: int) -> int:
-    """First day of the ATP season containing `date`, as YYYYMMDD.
-
-    The tour year does not follow the calendar: the season opens in the last
-    days of December, so the 2026 season begins in 2025.
-
-    The cut is 25 December, and the date is not arbitrary. December holds
-    events at both ends of the tour year -- the Next Gen Finals close a season
-    (18 Dec 2024, 22 Dec 2025) while Doha, Adelaide, Chennai, Brisbane, Pune,
-    Hong Kong and the United Cup open the next one (26-31 Dec). Across all 26
-    seasons in the database, 20-21 and 23-25 December are completely empty:
-    the last season-ending event is the 22nd, the earliest opener the 26th.
-    A cut of 25 December therefore separates them with room on both sides,
-    where 1 December -- tried first -- swept the Next Gen Finals into the
-    season it actually closes.
-    """
-    y, m, d = date // 10000, (date // 100) % 100, date % 100
-    m0, d0 = SEASON_CUT
-    if (m, d) >= (m0, d0):
-        return y * 10000 + m0 * 100 + d0
-    return (y - 1) * 10000 + m0 * 100 + d0
-
-
-def season_label(start: int) -> int:
-    """The season a start date belongs to -- December 2025 opens season 2026."""
-    return start // 10000 + 1
-
-
-@st.cache_data(ttl=CACHE_TTL, show_spinner="Rebuilding ratings to the season opener…")
-def load_elo_season() -> pd.DataFrame:
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def load_elo_season(tour: str = "atp") -> pd.DataFrame:
     """Season-to-date *movement* of the all-time rating, plus season W-L.
 
     Not a rating restarted at the season opener, which is what this began as
@@ -326,56 +310,45 @@ def load_elo_season() -> pd.DataFrame:
     that already knows what a Challenger win is worth, so beating rank 242
     *when you are rated to beat rank 242* moves nothing, and the column reads
     as genuine over- or under-performance against expectation.
+
+    The opening rating is not computed here: the feature pipeline records every
+    player's rating on the season's first day (`elo_state`, scope
+    'season_start'), so this is two queries rather than a replay of every match
+    ever played.
     """
-    from tennis.features.elo import EloBook
+    from tennis.features.elo import BASE_RATING
 
     con = connect()
     try:
-        end = con.execute("SELECT MAX(tourney_date) FROM matches").fetchone()[0]
-        if end is None:
-            return pd.DataFrame()
-        start = season_start(int(end))
-        prior = pd.read_sql(
-            """SELECT m.winner_id, m.loser_id, m.tourney_date, t.surface, m.status
-               FROM matches m JOIN tournaments t USING(tourney_key)
-               WHERE m.tourney_date < ? ORDER BY m.seq""", con, params=(start,))
+        row = con.execute("SELECT value FROM pipeline_state WHERE key = ?",
+                          (f"elo_season_start_{tour}",)).fetchone()
+        if row is None:
+            return pd.DataFrame()      # a database from before snapshots existed
+        start = int(row[0])
+        opening = pd.read_sql(
+            "SELECT player_id, rating FROM elo_state "
+            "WHERE scope = 'season_start' AND tour = ?", con, params=(tour,))
         season = pd.read_sql(
-            """SELECT m.winner_id, m.loser_id, m.status
-               FROM matches m WHERE m.tourney_date >= ?""", con, params=(start,))
+            "SELECT winner_id, loser_id FROM matches "
+            "WHERE tour = ? AND tourney_date >= ? AND status != 'walkover'",
+            con, params=(tour, start))
     finally:
         con.close()
     if season.empty:
         return pd.DataFrame()
 
-    # Replaying only the matches before the opener leaves the book holding
-    # exactly the state it had on day one of the season.
-    prior = prior[prior["status"] != "walkover"]
-    book = EloBook()
-    for w, l, sf, d in zip(prior["winner_id"], prior["loser_id"],
-                           prior["surface"], prior["tourney_date"]):
-        day = _ord(int(d))
-        book.update(w, l, "overall", day=day)
-        if isinstance(sf, str) and sf in ELO_SCOPES:
-            book.update(w, l, sf, day=day)
-        book.touch(w, day)
-        book.touch(l, day)
-
-    season = season[season["status"] != "walkover"]
+    opened = dict(zip(opening["player_id"], opening["rating"]))
     wins = season.groupby("winner_id").size()
     losses = season.groupby("loser_id").size()
     ids = sorted(set(season["winner_id"]) | set(season["loser_id"]))
-    day0 = _ord(start)
     return pd.DataFrame({
         "player_id": ids,
-        "elo_start": [book.get(p, "overall", day0) for p in ids],
+        # Not in the snapshot means no match before the opener: a new player.
+        "elo_start": [opened.get(p, BASE_RATING) for p in ids],
         "season_w": [int(wins.get(p, 0)) for p in ids],
         "season_l": [int(losses.get(p, 0)) for p in ids],
         "season_start": start,
     })
-
-
-def _ord(d: int) -> int:
-    return pd.Timestamp(str(int(d))).toordinal()
 
 
 @st.cache_resource(ttl=CACHE_TTL, max_entries=4, show_spinner=False)
@@ -1809,9 +1782,10 @@ def page_ratings() -> None:
         st.warning("No Elo state. Run the feature pipeline.")
         return
 
-    sea = load_elo_season() if season else None
+    sea = load_elo_season(current_tour()) if season else None
     if season and (sea is None or sea.empty):
-        st.info("No matches yet this season.")
+        st.info("No season-to-date ratings yet: either no matches this season, or "
+                "the feature pipeline has not recorded this season's opening ratings.")
         return
     if season:
         elo = elo.merge(sea, on="player_id", how="inner")
@@ -1931,15 +1905,17 @@ def page_status() -> None:
     st.header("Data & pipeline status")
     con = connect()
     counts = {}
-    for t in ["matches", "players", "tournaments", "odds", "rankings",
+    for t in ["matches", "players", "tournaments", "rankings",
               "elo_state", "sim_results", "backtest"]:
         try:
             counts[t] = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
         except Exception:
             counts[t] = 0
     rng = con.execute("SELECT MIN(tourney_date), MAX(tourney_date) FROM matches").fetchone()
-    # odds holds one row per (match, bookmaker), so count distinct matches.
-    priced = con.execute("SELECT COUNT(DISTINCT match_id) FROM odds").fetchone()[0]
+    # The hosted bundle leaves the 25 MB odds table out and ships its two
+    # counts in serve_meta.json; on a laptop the table itself is there.
+    from tennis.ops import bundle
+    odds = (bundle.local_meta() or {}).get("odds") or bundle.odds_summary(con)
     state = dict(con.execute("SELECT key, value FROM pipeline_state").fetchall())
     con.close()
 
@@ -1947,8 +1923,8 @@ def page_status() -> None:
     c[0].metric("Matches", f"{counts['matches']:,}")
     c[1].metric("Players", f"{counts['players']:,}")
     c[2].metric("Tournaments", f"{counts['tournaments']:,}")
-    c[3].metric("Matches with odds", f"{priced:,}",
-                help=f"{counts['odds']:,} price rows across all bookmakers")
+    c[3].metric("Matches with odds", f"{odds['matches']:,}",
+                help=f"{odds['rows']:,} price rows across all bookmakers")
     st.write(f"**Coverage:** {rng[0]} → {rng[1]}")
     st.json(state)
 
@@ -2195,23 +2171,48 @@ def page_betting() -> None:
     from tennis.models.predict import MatchContext
 
     pred = get_predictor(current_tour())
-    rows = []
-    for r in d.itertuples():
+    fixtures = list(d.itertuples())
+
+    def _event(r):
         # Surface and level come from the event, not from a constant. They were
         # pinned to Hard/atp250 here, which mispriced every clay and grass
         # fixture on the page while looking entirely normal.
-        level = getattr(r, "level", None) or "atp250"
-        ctx = MatchContext(surface=getattr(r, "surface", None) or "Hard",
-                           level=level, tour=current_tour(),
+        return (getattr(r, "surface", None) or "Hard",
+                getattr(r, "level", None) or "atp250")
+
+    # One predict_many per (surface, level): the context depends on nothing
+    # else, and each call carries a fixed cost (two orientations, one frame
+    # build, six tree-model passes) that per-fixture calls paid every time.
+    groups: dict[tuple[str, str], list[int]] = {}
+    for i, r in enumerate(fixtures):
+        groups.setdefault(_event(r), []).append(i)
+    model_p: dict[int, float] = {}
+    for (surface, level), idxs in groups.items():
+        ctx = MatchContext(surface=surface, level=level, tour=current_tour(),
                            # Only the men play best-of-five, and only at Slams.
                            best_of=(5 if level == "grand_slam"
                                     and current_tour() == "atp" else 3),
                            is_challenger=int(level == "challenger"))
+        pairs = [(fixtures[i].p1_id, fixtures[i].p2_id) for i in idxs]
         try:
-            pm = float(pred.predict_many([(r.p1_id, r.p2_id)], ctx)
-                       .iloc[0]["p1_win_prob"])
+            probs = pred.predict_many(pairs, ctx)["p1_win_prob"].to_numpy()
+            model_p.update(zip(idxs, (float(x) for x in probs)))
         except Exception:
+            # One unscoreable fixture (an id the engine has never seen) must
+            # not take its whole group down with it.
+            for i, pair in zip(idxs, pairs):
+                try:
+                    model_p[i] = float(pred.predict_many([pair], ctx)
+                                       .iloc[0]["p1_win_prob"])
+                except Exception:
+                    pass
+
+    rows = []
+    for i, r in enumerate(fixtures):
+        if i not in model_p:
             continue
+        pm = model_p[i]
+        level = _event(r)[1]
         mk = shin(np.array([[r.p1_odds, r.p2_odds]], dtype=float))[0][0, 0]
         ev1, ev2 = pm * r.p1_odds - 1, (1 - pm) * r.p2_odds - 1
         side1 = ev1 >= ev2
@@ -2317,8 +2318,8 @@ def _betting_reality(edge: float) -> None:
 
 
 PAGES = {
-    "Tournament simulation": page_simulation,
     "Match predictions": page_predictions,
+    "Tournament simulation": page_simulation,
     "Betting": page_betting,
     "Backtest performance": page_backtest,
     "Calibration": page_calibration,
