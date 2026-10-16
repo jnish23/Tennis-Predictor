@@ -192,3 +192,34 @@ def set_winners(score: str | float | None) -> list[int]:
             break
         out.append(1 if wg > lg else 0)
     return out
+
+
+def tiebreaks_won(score: str | float | None) -> tuple[int, int]:
+    """Tiebreaks taken by (match winner, match loser), from the score string.
+
+    A 7-6 set was decided by a tiebreak and its winner is simply the side with
+    the 7; the score is winner-first, so "6-7(4)" is a tiebreak the *loser*
+    took. A bracketed "[10-7]" match tiebreak, played in place of a deciding
+    set, counts too. Sets that are not demonstrably finished (the in-progress
+    "6-6" a retirement can leave) are not counted: no tiebreak was completed.
+    """
+    if score is None or (isinstance(score, float) and score != score):
+        return 0, 0
+    w = l = 0
+    for tok in str(score).split():
+        bracketed = tok.startswith("[")
+        t = _TOKEN_CLEAN.sub("", tok).strip()
+        m = _SET_RE.match(t)
+        if not m:
+            continue
+        a, b = int(m.group(1)), int(m.group(2))
+        if bracketed or (max(a, b) >= 10 and abs(a - b) >= 2):
+            tb = a != b            # a match tiebreak, however it is written
+        else:
+            tb = (a, b) in ((7, 6), (6, 7))
+        if tb:
+            if a > b:
+                w += 1
+            else:
+                l += 1
+    return w, l

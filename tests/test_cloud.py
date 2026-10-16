@@ -43,7 +43,9 @@ def test_slim_db_keeps_serving_tables_and_drops_research_rows(tmp_path):
     counts = bundle.build_slim_db(src, dst)
     con = sqlite3.connect(dst)
     assert con.execute("SELECT COUNT(*) FROM matches").fetchone()[0] == 1
-    assert con.execute("SELECT COUNT(*) FROM odds").fetchone()[0] == 2
+    # odds is only ever counted by the status page, so its rows stay behind
+    # (25 MB) and the counts travel in serve_meta.json instead
+    assert con.execute("SELECT COUNT(*) FROM odds").fetchone()[0] == 0
     assert con.execute("SELECT COUNT(*) FROM odds_quotes").fetchone()[0] == 0
     assert con.execute("SELECT COUNT(*) FROM te_matches").fetchone()[0] == 0
     # the schema is whole, so a stray query against a research table still runs

@@ -183,6 +183,24 @@ players with ≥20 matches vs a lefty show z-score sd 1.056 against 1.000 expect
 χ² p = 0.023 — but it is small, and with 20–50 such matches per player a
 "win rate vs lefties" feature would be mostly noise. Not added.
 
+**Second batch (walk-forward 2012–2026, paired bootstrap by match,
+`scripts/experiment_feature_batch.py`).** Deltas are log loss for the winner
+and MAE in games for totals and spread; negative is better.
+
+| change | winner | totals | spread | verdict |
+|---|---|---|---|---|
+| `best_of` actually reaching the model (was NaN in every row) | −0.00018 (noise) | **−0.051** (15/15 seasons) | −0.001 (noise) | **kept** |
+| real tiebreak win rate (was a match win rate) | +0.00015 (noise) | −0.001 | −0.001 | kept, as it is the correct definition |
+| shrink decider / tiebreak / career rates toward 0.5 | 0.000 | −0.0002 | −0.0002 | not adopted |
+| tournament speed index (prior seasons only) | +0.00022 | −0.001 | −0.0005 | not adopted |
+| symmetric serve features (totals/spread only) | n/a | −0.002 | +0.0001 | not adopted |
+| opponent-adjusted serve/return EWMAs | −0.00004 | −0.0002 | −0.0025 (12/15) | not adopted: 0.06% of MAE |
+| surface-specific serve/return EWMAs | +0.0002 | −0.0036 (12/15) | −0.0014 | not adopted: 0.07% of MAE |
+
+The candidate columns are still computed by the engine and written to the
+features parquet, but are not in `FEATURE_COLS`. Of twelve comparisons, the two
+that cleared their CI are tiny, which is about what chance alone produces.
+
 **Four feature groups were A/B'd** on a 2023+ holdout. Individually none cleared
 noise; together they did:
 
