@@ -54,10 +54,20 @@ def per_row_loss(y: np.ndarray, p: np.ndarray) -> np.ndarray:
     return -(y * np.log(p) + (1 - y) * np.log(1 - p))
 
 
-def fit_predict(tr: pd.DataFrame, te: pd.DataFrame, feats: list[str]) -> np.ndarray:
-    """Fit the winner model with its isotonic calibrator, exactly as training does."""
+def fit_predict(tr: pd.DataFrame, te: pd.DataFrame, feats: list[str],
+                target: str) -> np.ndarray:
+    """Fit the winner model with its isotonic calibrator.
+
+    This is the original 85/15 scheme, kept so the two arms stay comparable with
+    the figures quoted elsewhere; `train.run_backtest` has since moved to
+    out-of-fold calibration. The calibrator is fitted on the target tour's rows
+    of the held-out tail only. One curve fitted on the pooled tail (74% ATP)
+    pulls the WTA onto the ATP's miscalibration -- its ECE came out 5.4x the
+    ATP's -- and that is a property of the calibrator, not of pooling the fit.
+    """
     cut = int(len(tr) * 0.85)
     tr_fit, tr_cal = tr.iloc[:cut], tr.iloc[cut:]
+    tr_cal = tr_cal[(tr_cal["tour"] == target).to_numpy()]
     m = _fit(WIN_PARAMS, tr_fit, tr_fit["y_win"].to_numpy(), feats,
              rounds=WIN_ROUNDS)
     iso = IsotonicRegression(out_of_bounds="clip", y_min=0.01, y_max=0.99)
@@ -80,7 +90,12 @@ def main() -> None:
     # different category sets -- and they do, the tours share few tournaments
     # and no players -- concatenate to plain object/str, which LightGBM
     # rejects outright rather than silently mistreating.
-    both = prepare(pd.concat([tgt, oth], ignore_index=True))
+    # Sorted by date: the 85/15 split below is positional, and a frame with the
+    # target tour first and the other after it put every ATP row in the
+    # calibration tail and every WTA row in the fit.
+    both = prepare(pd.concat([tgt, oth], ignore_index=True)
+                   .sort_values(["tourney_date", "tour", "seq"], kind="stable")
+                   .reset_index(drop=True))
     both["tour"] = both["tour"].astype("category")
     feats_sep = list(FEATURE_COLS)
     feats_pool = list(FEATURE_COLS) + ["tour"]
@@ -105,8 +120,8 @@ def main() -> None:
         assert (te["match_id"].to_numpy() == te_pool["match_id"].to_numpy()).all(), \
             "pooled and separate arms are not scoring the same matches"
         t0 = time.time()
-        p_sep = fit_predict(tr_sep, te, feats_sep)
-        p_pool = fit_predict(tr_pool, te_pool, feats_pool)
+        p_sep = fit_predict(tr_sep, te, feats_sep, target)
+        p_pool = fit_predict(tr_pool, te_pool, feats_pool, target)
         y = te["y_win"].to_numpy()
         l_sep, l_pool = per_row_loss(y, p_sep), per_row_loss(y, p_pool)
         losses.append(pd.DataFrame({"season": s, "sep": l_sep, "pool": l_pool}))

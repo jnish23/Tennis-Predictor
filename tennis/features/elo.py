@@ -8,7 +8,10 @@ K decays with a player's match count so established players move slowly while
 newcomers converge quickly (the shape used by FiveThirtyEight's tennis Elo).
 
 Three tuned behaviours, each measured standalone against 124,899 matches from
-2010 on (`scripts/experiment_elo2.py`):
+2010 on (`scripts/experiment_elo2.py`). That window included the seasons now
+reserved as holdout (2023+), so these constants are in-sample to them; the
+script now selects on 2010-2022 and reports 2023+ apart, and the constants
+should only be re-chosen that way:
 
 **Surface prior.** A surface rating is seeded from the player's *overall*
 rating rather than 1500, then blended toward the surface-specific value as

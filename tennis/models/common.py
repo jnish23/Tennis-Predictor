@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import numpy as np
 import pandas as pd
+from sklearn.isotonic import IsotonicRegression
 
 # Columns that exist in the feature frame but must never be model inputs.
 LABEL_COLS = [
@@ -66,9 +67,56 @@ FEATURE_COLS: list[str] = (
     + CATEGORICAL
 )
 
-# Features that are inherently orientation-symmetric matter for the totals
-# model: the total does not depend on which player we called p1.
-SYMMETRIC_DROP = ["d_elo", "d_rank", "d_h2h"]
+
+def season_of(tourney_date) -> np.ndarray:
+    """Tour season of a YYYYMMDD date: the year it counts toward.
+
+    The tour year opens in the last days of December, so the United Cup, Brisbane
+    and Auckland (26-31 Dec) belong to the season they begin, as `elo.season_start`
+    already has them. Splitting folds on the calendar year put those events at
+    the back of the previous season instead. The cut is the same 25 December.
+    """
+    d = np.asarray(tourney_date)
+    return d // 10000 + (d % 10000 >= 1225)
+
+
+def swap_sides(df: pd.DataFrame) -> pd.DataFrame:
+    """The same matches with p1 and p2 exchanged, exactly as the engine would
+    have emitted them for the opposite orientation.
+
+    The model is not antisymmetric -- it reads the p1_* and p2_* blocks through
+    different trees -- so p(A, B) + p(B, A) is not 1. Serving averages both
+    orientations (`Predictor.predict_many`); a backtest has to do the same or it
+    scores a model nobody ships. Done on columns rather than by re-running the
+    engine so a whole walk-forward fold can be flipped in one pass.
+    """
+    out = df.copy()
+    pairs = []
+    for c in df.columns:
+        if c.startswith("p1_"):
+            pairs.append((c, "p2_" + c[3:]))
+        elif c.startswith("h2h_surf_p1"):
+            pairs.append((c, c.replace("_p1", "_p2")))
+        elif c == "h2h_p1":
+            pairs.append((c, "h2h_p2"))
+        elif c == "log_p1_rank":
+            pairs.append((c, "log_p2_rank"))
+        elif c == "exp_serve_p1":
+            pairs.append((c, "exp_serve_p2"))
+    for a, b in pairs:
+        if a in df.columns and b in df.columns:
+            out[a], out[b] = df[b].to_numpy(), df[a].to_numpy()
+    for c in df.columns:
+        if c.startswith("d_"):          # abs_d_* are already orientation-free
+            out[c] = -df[c]
+    for c in ("elo_prob", "elo_surf_prob"):
+        if c in df.columns:
+            out[c] = 1.0 - df[c]
+    if "y_win" in df.columns:
+        out["y_win"] = 1 - df["y_win"]
+    if "y_spread" in df.columns:
+        out["y_spread"] = -df["y_spread"]
+    return out
 
 
 def prepare(df: pd.DataFrame) -> pd.DataFrame:
@@ -91,6 +139,54 @@ def prepare(df: pd.DataFrame) -> pd.DataFrame:
     return out
 
 
+# Lives here, not in train.py: models.pkl pickles it, and a class defined in a
+# module run with `python -m` would be saved as `__main__.TourCalibrator`.
+# A tour needs this many calibration rows (both orientations counted) to get a
+# calibrator of its own; below it the pooled one stands in.
+MIN_TOUR_CAL_ROWS = 4000
+
+
+class TourCalibrator:
+    """Isotonic calibration, one curve per tour.
+
+    The booster is pooled across ATP and WTA, but a single curve fitted on the
+    mix (about three quarters ATP) bends the WTA onto the ATP's miscalibration:
+    its ECE came out 5.4x the ATP's, under-predicting every bin below 0.5 and
+    over-predicting every bin above it. The pooled curve is kept as the fallback
+    for a tour with too little data to stand alone.
+    """
+
+    def __init__(self, by_tour: dict, pooled: IsotonicRegression):
+        self.by_tour, self.pooled = by_tour, pooled
+
+    @staticmethod
+    def _iso(x, y) -> IsotonicRegression:
+        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.01, y_max=0.99)
+        return iso.fit(x, y)
+
+    @classmethod
+    def fit(cls, raw_fwd, raw_rev, y, tours) -> "TourCalibrator":
+        """Fit on both orientations: the reverse-side prediction of a match is a
+        prediction of the opposite outcome, and serving calibrates each side."""
+        x = np.concatenate([raw_fwd, raw_rev])
+        yy = np.concatenate([y, 1 - y])
+        tt = np.concatenate([tours, tours]).astype(str)
+        by_tour = {t: cls._iso(x[tt == t], yy[tt == t])
+                   for t in np.unique(tt) if (tt == t).sum() >= MIN_TOUR_CAL_ROWS}
+        return cls(by_tour, cls._iso(x, yy))
+
+    def predict(self, raw, tours=None) -> np.ndarray:
+        raw = np.asarray(raw, dtype=float)
+        out = self.pooled.predict(raw)
+        if tours is not None:
+            tours = np.asarray(tours).astype(str)
+            for t, iso in self.by_tour.items():
+                m = tours == t
+                if m.any():
+                    out[m] = iso.predict(raw[m])
+        return out
+
+
 def walk_forward_folds(
     df: pd.DataFrame,
     *,
@@ -103,9 +199,8 @@ def walk_forward_folds(
     in season S. No shuffling and no random splits: a training row is always
     strictly earlier than every row it is used to predict.
     """
-    seasons = np.sort(df["tourney_date"].to_numpy() // 10000)
-    uniq = [s for s in np.unique(seasons) if s >= start_season]
-    date = df["tourney_date"].to_numpy() // 10000
+    date = season_of(df["tourney_date"].to_numpy())
+    uniq = [s for s in np.unique(date) if s >= start_season]
     folds = []
     for s in uniq:
         train = np.where(date < s)[0]

@@ -15,8 +15,14 @@ Items covered (see the variants table below):
   ALL  V1 + every group that earned its place (set below after the runs)
 
 Each variant is fitted exactly as `train.run_backtest` fits: expanding window
-by season, a held-out 15% tail for the isotonic calibrator, the production
-hyper-parameters. Differences are reported *paired*: the same test rows under
+by season, the booster on every earlier row, a per-tour isotonic calibrator fitted
+on the previous seasons' out-of-fold predictions, both orientations scored and
+averaged, the production hyper-parameters.
+
+Selection discipline: a variant is judged on seasons before `HOLDOUT_FROM`
+(`delta`, `ci_*`), and the seasons after it are shown apart (`holdout_delta`) and
+never used to choose. An earlier round chose its feature subset on the whole
+2012+ window, so the holdout seasons were not out of sample for it. Differences are reported *paired*: the same test rows under
 both models, with a bootstrap over matches, because two models that predict the
 same rows disagree far less than their two independent intervals suggest.
 
@@ -35,13 +41,13 @@ import pandas as pd
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
-from sklearn.isotonic import IsotonicRegression  # noqa: E402
-
 from tennis.config import ARTIFACTS  # noqa: E402
-from tennis.models.common import (CATEGORICAL, FEATURE_COLS, prepare,  # noqa: E402
+from tennis.models.common import (FEATURE_COLS, prepare,  # noqa: E402
                                   walk_forward_folds)
-from tennis.models.train import (REG_PARAMS, WIN_PARAMS, WIN_ROUNDS, _fit,  # noqa: E402
-                                 _playable, add_abs)
+from tennis.models.evaluate import HOLDOUT_FROM  # noqa: E402
+from tennis.models.train import (CAL_SEASONS, REG_PARAMS, WIN_PARAMS,  # noqa: E402
+                                 WIN_ROUNDS, _calibrator_from, _fit, _playable,
+                                 _symmetric_regression, _winner_raw, add_abs)
 
 START_SEASON = 2012
 OLD_DIR = Path(sys.argv[sys.argv.index("--old") + 1]) if "--old" in sys.argv else None
@@ -130,11 +136,12 @@ def run(name: str) -> None:
         assert c in df.columns, f"{name}: missing column {c}"
 
     OUT.mkdir(parents=True, exist_ok=True)
-    folds = walk_forward_folds(df, start_season=START_SEASON)
-    rows = []
+    folds = walk_forward_folds(df, start_season=START_SEASON - CAL_SEASONS)
+    rows, oof = [], []
     t0 = time.time()
     for train_idx, test_idx, season in folds:
         tr, te = df.iloc[train_idx], df.iloc[test_idx]
+        scored = season >= START_SEASON
         rec = pd.DataFrame({
             "match_id": te["match_id"].to_numpy(), "season": season,
             "tour": te["tour"].astype(str).to_numpy(),
@@ -143,18 +150,27 @@ def run(name: str) -> None:
             "y_spread": te["y_spread"].to_numpy(),
         })
         if "win" not in reuse:
-            cut = int(len(tr) * 0.85)
-            fit, cal = tr.iloc[:cut], tr.iloc[cut:]
-            m = _fit(WIN_PARAMS, fit, fit["y_win"].to_numpy(), win_feats,
+            m = _fit(WIN_PARAMS, tr, tr["y_win"].to_numpy(), win_feats,
                      rounds=WIN_ROUNDS)
-            iso = IsotonicRegression(out_of_bounds="clip", y_min=0.01, y_max=0.99)
-            iso.fit(m.predict(cal[win_feats]), cal["y_win"].to_numpy())
-            rec["p_win"] = iso.predict(m.predict(te[win_feats]))
+            raw_f, raw_r = _winner_raw(m, te, win_feats)
+            oof.append(pd.DataFrame({"season": season, "tour": rec["tour"],
+                                     "y": rec["y_win"], "raw_fwd": raw_f,
+                                     "raw_rev": raw_r}))
+            if scored:
+                cal = _calibrator_from(pd.concat(
+                    [o for o in oof if season - CAL_SEASONS <= o["season"].iat[0] < season],
+                    ignore_index=True))
+                t = rec["tour"].to_numpy()
+                rec["p_win"] = (cal.predict(raw_f, t) + 1.0 - cal.predict(raw_r, t)) / 2.0
+        if not scored:
+            continue
         trt = tr[tr["y_total_games"].notna()]
-        rec["pred_total"] = _fit(REG_PARAMS, trt, trt["y_total_games"].to_numpy(),
-                                 reg_feats).predict(te[reg_feats])
-        rec["pred_spread"] = _fit(REG_PARAMS, trt, trt["y_spread"].to_numpy(),
-                                  reg_feats).predict(te[reg_feats])
+        rec["pred_total"] = _symmetric_regression(
+            _fit(REG_PARAMS, trt, trt["y_total_games"].to_numpy(), reg_feats),
+            te, reg_feats)
+        rec["pred_spread"] = _symmetric_regression(
+            _fit(REG_PARAMS, trt, trt["y_spread"].to_numpy(), reg_feats),
+            te, reg_feats, signed=True)
         rows.append(rec)
         print(f"  {name} season {season} done ({time.time() - t0:.0f}s)", flush=True)
     out = pd.concat(rows, ignore_index=True)
@@ -187,14 +203,21 @@ def compare(a: str, b: str, target: str, rng) -> dict:
     d = (rb - ra).dropna()
     meta = pd.read_parquet(OUT / f"{b}.parquet").drop_duplicates("match_id").set_index("match_id")
     seasons = meta.loc[d.index, "season"].to_numpy()
-    by_season = pd.Series(d.to_numpy()).groupby(seasons).mean()
-    boots = [d.to_numpy()[rng.integers(0, len(d), len(d))].mean() for _ in range(300)]
+    # Choose on the development seasons only; the holdout is reported, not used.
+    dev = seasons < HOLDOUT_FROM
+    d_dev = d[dev]
+    by_season = pd.Series(d_dev.to_numpy()).groupby(seasons[dev]).mean()
+    boots = [d_dev.to_numpy()[rng.integers(0, len(d_dev), len(d_dev))].mean()
+             for _ in range(300)]
     lo, hi = np.percentile(boots, [2.5, 97.5])
-    return {"vs": a, "variant": b, "target": target, "n": len(d),
-            "level": round(float(ra.dropna().mean()), 5),
-            "delta": round(float(d.mean()), 5), "ci_lo": round(float(lo), 5),
+    hold = d[~dev]
+    return {"vs": a, "variant": b, "target": target, "n": len(d_dev),
+            "level": round(float(ra.dropna().loc[ra.dropna().index.isin(d_dev.index)].mean()), 5),
+            "delta": round(float(d_dev.mean()), 5), "ci_lo": round(float(lo), 5),
             "ci_hi": round(float(hi), 5),
-            "seasons_better": f"{int((by_season < 0).sum())}/{len(by_season)}"}
+            "seasons_better": f"{int((by_season < 0).sum())}/{len(by_season)}",
+            "holdout_n": len(hold),
+            "holdout_delta": round(float(hold.mean()), 5) if len(hold) else np.nan}
 
 
 def report() -> None:

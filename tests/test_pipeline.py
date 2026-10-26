@@ -1424,21 +1424,22 @@ def test_tourney_meta_trusts_a_challenger_name_over_the_history():
     """
     import sqlite3
 
+    import numpy as np
     import pandas as pd
 
     src = open("dashboard/app.py").read()
     start = src.index("LEVEL_ORDER = {")
     end = src.index("# Short TTL", start)
-    ns: dict = {"pd": pd}
+    ns: dict = {"pd": pd, "np": np}
     exec(src[start:end], ns)
 
     con = sqlite3.connect(":memory:")
     con.execute("CREATE TABLE tournaments (name TEXT, level TEXT, "
-                "surface TEXT, season INT)")
-    con.executemany("INSERT INTO tournaments VALUES (?,?,?,?)", [
-        ("Cincinnati Masters", "masters", "Hard", 2026),
-        ("Winston Salem", "atp250", "Hard", 2025),
-        ("Prague 2", "challenger", "Clay", 2024),
+                "surface TEXT, season INT, draw_size INT, indoor REAL)")
+    con.executemany("INSERT INTO tournaments VALUES (?,?,?,?,?,?)", [
+        ("Cincinnati Masters", "masters", "Hard", 2026, 96, 0.0),
+        ("Winston Salem", "atp250", "Hard", 2025, 48, 0.0),
+        ("Prague 2", "challenger", "Clay", 2024, 32, 1.0),
     ])
     out = ns["_tourney_meta"](pd.Series([
         "Cincinnati", "Winston Salem", "Prague 2 challenger",
@@ -1452,6 +1453,10 @@ def test_tourney_meta_trusts_a_challenger_name_over_the_history():
     assert out.loc["Prague 2 challenger", "surface"] == "Clay"
     # Absent from history: the name still settles the level.
     assert out.loc["Sion challenger", "level"] == "challenger"
+    # The event's shape rides along, so a 96-draw Masters is not priced as a 250.
+    assert out.loc["Cincinnati", "draw_size"] == 96
+    assert out.loc["Prague 2 challenger", "indoor"] == 1.0
+    assert np.isnan(out.loc["Sion challenger", "draw_size"])
 
     order = ns["LEVEL_ORDER"]
     assert order["grand_slam"] < order["masters"] < order["atp250"] < order["challenger"]

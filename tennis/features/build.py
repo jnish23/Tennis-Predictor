@@ -27,7 +27,7 @@ import pandas as pd
 
 from tennis.config import ARTIFACTS
 from tennis.features.elo import EloBook
-from tennis.ingest.parse import tiebreaks_won
+from tennis.ingest.parse import DEFAULT, UNFINISHED, WALKOVER, tiebreaks_won
 
 log = logging.getLogger(__name__)
 
@@ -35,6 +35,12 @@ FORM_WINDOWS = (10, 25, 50)
 SURF_WINDOW = 25
 STAT_WINDOW = 25
 MAXLEN = 60  # longest window we ever read
+
+# Statuses that carry no result worth rating or learning from: a walkover was
+# never played, a default is a disqualification, and an unfinished match has no
+# winner to speak of. Retirements are NOT in here -- a retirement is a win, and
+# the Elo book is tuned with them counted.
+NOT_PLAYED = (WALKOVER, DEFAULT, UNFINISHED)
 
 # Pseudo-observations of 0.5 added to a win rate before it is read. A player
 # with 1 tiebreak played and 1 won is not a 100% tiebreak player; the prior
@@ -57,6 +63,50 @@ def _date_to_ord(d: int) -> int:
     # match, so cache it; datetime.date is also ~10x cheaper than pd.Timestamp.
     y, m, dd = d // 10000, (d // 100) % 100, d % 100
     return _dt.date(y, max(m, 1), max(dd, 1)).toordinal()
+
+
+# Days from an event's first day to the day each round is played. The archived
+# files stamp every match with the Monday the event began, so without this a
+# final reads as played on day 0 and every later-round opponent as having had
+# zero rest. Medians of (match_date - event start) over the 66,553 ATP matches
+# whose true date is known, by event shape; challengers and the WTA, which
+# carry no per-match dates at all, borrow the one-week shape.
+_ROUND_DAY = {
+    "slam": {"R128": 1, "R64": 3, "R32": 5, "R16": 7, "QF": 9, "SF": 11, "F": 13},
+    "long": {"R128": 1, "R64": 3, "R32": 5, "R16": 7, "QF": 8, "SF": 10, "F": 11},
+    "week": {"R64": 1, "R32": 1, "R16": 3, "QF": 4, "SF": 5, "F": 6,
+             "RR": 1, "BR": 6, "3RD/4TH": 6},
+}
+
+
+def _round_day(row) -> int:
+    """Estimated days after the event's first day that this match was played."""
+    if row.get("level") == "grand_slam":
+        shape = "slam"
+    else:
+        ds = row.get("draw_size")
+        shape = "long" if ds is not None and ds == ds and ds >= 96 else "week"
+    rnd = row.get("round")
+    return _ROUND_DAY[shape].get(rnd if isinstance(rnd, str) else "", 0)
+
+
+def _play_ord(row) -> int:
+    """Day-ordinal a match was played on, as well as the data allows.
+
+    `tourney_date` is the event's start, kept for grouping. Where the source
+    recorded the real day (`date_is_exact`) that wins; where it stamped the whole
+    event with its first day, the day is placed by round. Both are known before
+    the match is played, so this is not a leak. Rows that do not say either way
+    -- a live prediction, whose `tourney_date` already is the day -- are taken
+    at face value.
+    """
+    start = int(row["tourney_date"])
+    if row.get("date_is_exact") == 0:
+        return _date_to_ord(start) + _round_day(row)
+    md = row.get("match_date")
+    if row.get("date_is_exact") == 1 and md is not None and md == md:
+        return _date_to_ord(int(md))
+    return _date_to_ord(start)
 
 
 def _side_is_winner_first(match_id: str) -> bool:
@@ -189,7 +239,14 @@ class PlayerState:
 class FeatureEngine:
     """Holds all running state; can be pickled to support incremental updates."""
 
+    # Bumped whenever a change alters what the engine would emit for matches it
+    # has already folded in, so a saved state from before it is rebuilt rather
+    # than extended. 2: matches dated by round within an event, and defaults /
+    # unfinished matches no longer rated.
+    VERSION = 2
+
     def __init__(self) -> None:
+        self.version = FeatureEngine.VERSION
         self.elo = EloBook()
         self.players: dict[str, PlayerState] = defaultdict(PlayerState)
         self.h2h: dict[tuple[str, str], int] = defaultdict(int)
@@ -291,7 +348,7 @@ class FeatureEngine:
         # off a surface change is a different proposition from one mid-swing.
         f["surf_streak"] = st.surf_streak if st.last_surface == surface else 0
 
-        f["rest_days"] = (date_ord - st.last_date) if st.last_date is not None else np.nan
+        f["rest_days"] = max(date_ord - st.last_date, 0) if st.last_date is not None else np.nan
         f["matches_14d"] = sum(1 for d in st.dates if 0 <= date_ord - d <= 14)
         f["matches_30d"] = sum(1 for d in st.dates if 0 <= date_ord - d <= 30)
         f["minutes_14d"] = float(sum(
@@ -308,7 +365,7 @@ class FeatureEngine:
         leaves it None so orientation stays outcome-independent.
         """
         surface = row["surface"] if isinstance(row["surface"], str) else ""
-        date_ord = _date_to_ord(int(row["tourney_date"]))
+        date_ord = _play_ord(row)
         w, l = row["winner_id"], row["loser_id"]
 
         winner_first = (
@@ -450,11 +507,11 @@ class FeatureEngine:
     def update(self, row) -> None:
         """Fold a played match into state. Call only after features_for()."""
         status = row["status"]
-        if status == "walkover":
-            return  # nothing happened on court
+        if status in NOT_PLAYED:
+            return  # nothing, or nothing countable, happened on court
 
         surface = row["surface"] if isinstance(row["surface"], str) else ""
-        date_ord = _date_to_ord(int(row["tourney_date"]))
+        date_ord = _play_ord(row)
         w, l = row["winner_id"], row["loser_id"]
 
         # Opponent strength is what was known going in, so read it before this
@@ -505,7 +562,7 @@ class FeatureEngine:
         sw.career_n += 1
         sl.career_n += 1
         for st in (sw, sl):
-            st.last_date = date_ord
+            st.last_date = date_ord if st.last_date is None else max(st.last_date, date_ord)
             st.dates.append(date_ord)
             st.minutes.append(row["minutes"] if not pd.isna(row["minutes"]) else np.nan)
 
@@ -648,7 +705,8 @@ def _diff(a, b):
 
 
 REQUIRED = [
-    "match_id", "seq", "tourney_date", "winner_id", "loser_id", "surface",
+    "match_id", "seq", "tourney_date", "match_date", "date_is_exact", "round",
+    "winner_id", "loser_id", "surface",
     "level", "is_challenger", "status", "best_of", "round_idx", "draw_size",
     "indoor", "minutes", "has_stats", "totals_usable", "total_games",
     "total_sets", "game_margin", "winner_rank", "loser_rank",

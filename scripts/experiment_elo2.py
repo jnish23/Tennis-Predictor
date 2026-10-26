@@ -10,6 +10,11 @@ Adds the two ideas the first sweep did not separate:
 * **margin of victory**, scaling K by how one-sided the result was, so 6-0 6-0
   moves a rating further than 7-6 7-6.
 
+Selection is on the development seasons (SCORE_FROM..HOLDOUT_FROM-1) only. The
+holdout seasons are reported in their own columns and must not pick a winner:
+the constants in `features/elo.py` were first chosen on a 2010+ window that
+included them, so those seasons were never out of sample for that choice.
+
 Run:  python scripts/experiment_elo2.py
 """
 from __future__ import annotations
@@ -27,6 +32,7 @@ from tennis.db.schema import connect  # noqa: E402
 
 BASE = 1500.0
 SCORE_FROM = 2010
+HOLDOUT_FROM = 2023          # reported, never selected on
 
 
 def load() -> pd.DataFrame:
@@ -94,6 +100,7 @@ def run(df: pd.DataFrame, c: Cfg) -> dict:
         return v
 
     ll_o, ll_s, acc = [], [], []
+    h_o, h_s = [], []
     for i in range(len(df)):
         w, l, sf, s, day = W[i], L[i], SF[i], S[i], D[i]
         ko, lo = f"{w}\x00overall", f"{l}\x00overall"
@@ -115,7 +122,10 @@ def run(df: pd.DataFrame, c: Cfg) -> dict:
             kws = lws = None
             es = ew
 
-        if s >= SCORE_FROM:
+        if s >= HOLDOUT_FROM:
+            h_o.append(-np.log(max(ew, 1e-15)))
+            h_s.append(-np.log(max(es, 1e-15)))
+        elif s >= SCORE_FROM:
             ll_o.append(-np.log(max(ew, 1e-15)))
             ll_s.append(-np.log(max(es, 1e-15)))
             acc.append(1.0 if ew >= 0.5 else 0.0)
@@ -151,12 +161,15 @@ def run(df: pd.DataFrame, c: Cfg) -> dict:
         "ll_overall": round(float(np.mean(ll_o)), 5),
         "ll_surface": round(float(np.mean(ll_s)), 5),
         "accuracy": round(float(np.mean(acc)), 5),
+        "holdout_ll_overall": round(float(np.mean(h_o)), 5),
+        "holdout_ll_surface": round(float(np.mean(h_s)), 5),
     }
 
 
 def main() -> None:
     df = load()
-    print(f"{len(df):,} rated matches, scoring {SCORE_FROM}+\n")
+    print(f"{len(df):,} rated matches, selecting on {SCORE_FROM}-{HOLDOUT_FROM - 1}, "
+          f"holdout {HOLDOUT_FROM}+\n")
 
     cfgs = [
         Cfg("baseline (current)"),
@@ -197,6 +210,7 @@ def main() -> None:
     base = out[out.variant == "baseline (current)"].iloc[0]
     out["Δ overall"] = (base.ll_overall - out.ll_overall).round(5)
     out["Δ surface"] = (base.ll_surface - out.ll_surface).round(5)
+    out["holdout Δ surface"] = (base.holdout_ll_surface - out.holdout_ll_surface).round(5)
     print(out.sort_values("ll_surface").to_string(index=False))
     print("\n(Δ positive = better than current)")
 

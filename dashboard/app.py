@@ -680,8 +680,11 @@ def _market_lines(rep: dict) -> None:
             "**Signal, not profit — and the last column is why.** These bets are "
             "placed at "
             f"{c.get('book','Pinnacle')}'s *opening* line and scored against the "
-            "close, one bet per match. The value is real and statistically "
-            "overwhelming: the market moves toward us more often than not. But "
+            "close, one observation per match (every rung the model likes, "
+            "averaged within the match). The value is real: the market moves "
+            "toward us more often than not. Picking only the single "
+            "highest-edge rung looks better but is flattered by its own "
+            "selection, so it is not the headline. But "
             "the margin on those same lines is 3–4 points, so the edge covers "
             "roughly a tenth of what totals needs and a third of what spread "
             "needs. Read the CLV column and the vig column together or not at "
@@ -2004,7 +2007,8 @@ def _tourney_meta(names: pd.Series, con) -> pd.DataFrame:
                    (s or "").lower())
         return " ".join(re.sub(r"[^a-z0-9 ]", " ", s).split())
 
-    hist = pd.read_sql("SELECT name, level, surface, season FROM tournaments", con)
+    hist = pd.read_sql(
+        "SELECT name, level, surface, season, draw_size, indoor FROM tournaments", con)
     hist["k"] = hist.name.map(norm)
     hist = (hist.sort_values("season", ascending=False)
                 .drop_duplicates("k").set_index("k"))
@@ -2018,7 +2022,12 @@ def _tourney_meta(names: pd.Series, con) -> pd.DataFrame:
         else:
             level = hit.level if hit is not None else None
         rows.append({"tournament": n, "level": level,
-                     "surface": hit.surface if hit is not None else "Hard"})
+                     "surface": hit.surface if hit is not None else "Hard",
+                     # Most recent edition's shape, so a live fixture is priced
+                     # in the draw and venue it is actually in rather than a
+                     # 32-draw outdoor default.
+                     "draw_size": hit.draw_size if hit is not None else np.nan,
+                     "indoor": hit.indoor if hit is not None else np.nan})
     return pd.DataFrame(rows).drop_duplicates("tournament")
 
 
@@ -2173,22 +2182,34 @@ def page_betting() -> None:
     pred = get_predictor(current_tour())
     fixtures = list(d.itertuples())
 
+    def _num(v, default):
+        return default if v is None or v != v else float(v)
+
     def _event(r):
         # Surface and level come from the event, not from a constant. They were
         # pinned to Hard/atp250 here, which mispriced every clay and grass
-        # fixture on the page while looking entirely normal.
+        # fixture on the page while looking entirely normal. The day, draw size
+        # and venue come with them: training dates each match by when it was
+        # played, so rest is measured from that day, not from this week's
+        # Monday, and a 96-draw Masters is not a 32-draw 250.
         return (getattr(r, "surface", None) or "Hard",
-                getattr(r, "level", None) or "atp250")
+                getattr(r, "level", None) or "atp250",
+                int(r.play_date),
+                _num(getattr(r, "draw_size", None), 32.0),
+                _num(getattr(r, "indoor", None), 0.0))
 
-    # One predict_many per (surface, level): the context depends on nothing
-    # else, and each call carries a fixed cost (two orientations, one frame
-    # build, six tree-model passes) that per-fixture calls paid every time.
-    groups: dict[tuple[str, str], list[int]] = {}
+    # One predict_many per event context: each call carries a fixed cost (two
+    # orientations, one frame build, six tree-model passes) that per-fixture
+    # calls paid every time. The round and the seeds are not known from the
+    # captured fixture list, so those stay at the context defaults.
+    groups: dict[tuple, list[int]] = {}
     for i, r in enumerate(fixtures):
         groups.setdefault(_event(r), []).append(i)
     model_p: dict[int, float] = {}
-    for (surface, level), idxs in groups.items():
+    for (surface, level, play_date, draw_size, indoor), idxs in groups.items():
         ctx = MatchContext(surface=surface, level=level, tour=current_tour(),
+                           tourney_date=play_date, draw_size=draw_size,
+                           indoor=indoor,
                            # Only the men play best-of-five, and only at Slams.
                            best_of=(5 if level == "grand_slam"
                                     and current_tour() == "atp" else 3),

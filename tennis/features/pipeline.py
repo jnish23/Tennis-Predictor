@@ -122,6 +122,8 @@ def run(full: bool = True, tour: str = "atp") -> dict:
         prior = pd.read_parquet(features_p)
         reason = _full_rebuild_reason(prior, matches)
         engine = None if reason else FeatureEngine.load(state_p)
+        if engine is not None and getattr(engine, "version", 1) != FeatureEngine.VERSION:
+            reason, engine = "saved state predates the current feature definitions", None
         if engine is not None and getattr(engine, "season_snap", None) is None:
             # A state saved before snapshots existed cannot recover the opener.
             reason, engine = "saved state has no season-opener snapshot", None
