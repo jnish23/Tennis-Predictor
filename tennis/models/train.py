@@ -21,18 +21,21 @@ import time
 import lightgbm as lgb
 import numpy as np
 import pandas as pd
-from sklearn.isotonic import IsotonicRegression
 
 from tennis.config import ARTIFACTS
 from tennis.db.schema import connect
+from tennis.features.build import NOT_PLAYED
 from tennis.features.pipeline import features_path
 from tennis.models.common import (
     CATEGORICAL,
     FEATURE_COLS,
+    TourCalibrator,
     calibration_table,
     classification_metrics,
     prepare,
     regression_metrics,
+    season_of,
+    swap_sides,
     walk_forward_folds,
 )
 
@@ -86,12 +89,15 @@ TOURS = ("atp", "wta")
 
 
 def _playable(df: pd.DataFrame) -> pd.DataFrame:
-    """Drop walkovers. Nothing was played, so there is no result to predict or
-    to be scored on -- they inflated the training and backtest sets by 1,324
-    rows. The engine still emits them; they just never reach a model."""
+    """Drop walkovers, defaults and unfinished matches. There is no on-court
+    result to predict or be scored on -- walkovers alone inflated the training
+    and backtest sets by 1,324 rows, and a default or an abandoned match is
+    settled by no bookmaker as an ordinary win. The engine still emits them;
+    they just never reach a model. Retirements stay: they are a real winner,
+    and `evaluate` settles them the way the book would."""
     if "status" not in df.columns:
         return df
-    return df[df["status"] != "walkover"].reset_index(drop=True)
+    return df[~df["status"].isin(NOT_PLAYED)].reset_index(drop=True)
 
 
 def load_features(tour: str = "pooled") -> pd.DataFrame:
@@ -136,6 +142,50 @@ def _fit(params, X, y, feats, rounds=N_ROUNDS):
     return lgb.train(params, ds, num_boost_round=rounds)
 
 
+# Seasons of out-of-fold winner predictions the calibrator is fitted on. The
+# booster itself trains on every earlier row; calibration used to come from a
+# held-out 15% tail of the training window, which starved the booster of the
+# newest 2.5-3.5 years in every fold (the 2026 fold's last training row was
+# July 2022) and, in production, paired a calibrator fitted on an 85%-data model
+# with a booster refit on 100%. Recent predictions made by models that never saw
+# them cost nothing in training data and describe how the model performs now.
+CAL_SEASONS = 3
+
+
+def _winner_raw(model, te: pd.DataFrame, feats: list[str]) -> tuple[np.ndarray, np.ndarray]:
+    """Raw winner probability for both orientations of every row."""
+    return (model.predict(te[feats]), model.predict(swap_sides(te)[feats]))
+
+
+def _symmetric_regression(model, te: pd.DataFrame, feats: list[str], *,
+                          signed: bool = False) -> np.ndarray:
+    """A regression target scored both ways round and averaged, as serving does.
+    The spread is p1-relative, so the reversed score is sign-flipped."""
+    fwd, rev = model.predict(te[feats]), model.predict(swap_sides(te)[feats])
+    return (fwd - rev) / 2.0 if signed else (fwd + rev) / 2.0
+
+
+def _oof_winner(df: pd.DataFrame, win_feats: list[str], seasons) -> pd.DataFrame:
+    """Out-of-fold winner predictions for `seasons`: each is made by a booster
+    fitted on every row before the season. The raw material for calibration."""
+    date = season_of(df["tourney_date"].to_numpy())
+    parts = []
+    for s in seasons:
+        tr, te = df[date < s], df[date == s]
+        if tr.empty or te.empty:
+            continue
+        m = _fit(WIN_PARAMS, tr, tr["y_win"].to_numpy(), win_feats, rounds=WIN_ROUNDS)
+        f, r = _winner_raw(m, te, win_feats)
+        parts.append(pd.DataFrame({"season": s, "tour": te["tour"].astype(str).to_numpy(),
+                                   "y": te["y_win"].to_numpy(), "raw_fwd": f, "raw_rev": r}))
+    return pd.concat(parts, ignore_index=True)
+
+
+def _calibrator_from(oof: pd.DataFrame) -> TourCalibrator:
+    return TourCalibrator.fit(oof["raw_fwd"].to_numpy(), oof["raw_rev"].to_numpy(),
+                              oof["y"].to_numpy(), oof["tour"].to_numpy())
+
+
 def run_backtest(start_season: int = 2010, run_tag: str | None = None,
                  tour: str = "pooled") -> dict:
     t0 = time.time()
@@ -145,25 +195,33 @@ def run_backtest(start_season: int = 2010, run_tag: str | None = None,
     win_feats = list(FEATURE_COLS)
     reg_feats = list(FEATURE_COLS) + abs_cols
 
-    folds = walk_forward_folds(df, start_season=start_season)
+    # Folds from CAL_SEASONS before the first scored season: those only produce
+    # out-of-fold winner predictions for the calibrator and are never reported.
+    folds = walk_forward_folds(df, start_season=start_season - CAL_SEASONS)
     log.info("%d walk-forward folds: %s", len(folds), [f[2] for f in folds])
 
-    preds = []
+    preds, oof = [], []
     for train_idx, test_idx, season in folds:
         tr, te = df.iloc[train_idx], df.iloc[test_idx]
 
         # ---- winner ------------------------------------------------------
-        # Hold out the last 15% of the training window (by date) to fit the
-        # isotonic calibrator, so calibration is never fitted on test data.
-        cut = int(len(tr) * 0.85)
-        tr_fit, tr_cal = tr.iloc[:cut], tr.iloc[cut:]
-        m_win = _fit(WIN_PARAMS, tr_fit, tr_fit["y_win"].to_numpy(), win_feats,
+        # The booster sees every earlier row. It is calibrated on the previous
+        # CAL_SEASONS seasons' out-of-fold predictions, never on test data.
+        m_win = _fit(WIN_PARAMS, tr, tr["y_win"].to_numpy(), win_feats,
                      rounds=WIN_ROUNDS)
-        raw_cal = m_win.predict(tr_cal[win_feats])
-        iso = IsotonicRegression(out_of_bounds="clip", y_min=0.01, y_max=0.99)
-        iso.fit(raw_cal, tr_cal["y_win"].to_numpy())
-        p_raw = m_win.predict(te[win_feats])
-        p_win = iso.predict(p_raw)
+        raw_f, raw_r = _winner_raw(m_win, te, win_feats)
+        oof.append(pd.DataFrame({
+            "season": season, "tour": te["tour"].astype(str).to_numpy(),
+            "y": te["y_win"].to_numpy(), "raw_fwd": raw_f, "raw_rev": raw_r}))
+        if season < start_season:
+            continue
+        hist = pd.concat([o for o in oof if season - CAL_SEASONS <= o["season"].iat[0] < season],
+                         ignore_index=True)
+        cal = _calibrator_from(hist)
+        tours = te["tour"].astype(str).to_numpy()
+        p_f, p_r = cal.predict(raw_f, tours), cal.predict(raw_r, tours)
+        # Same combination Predictor.predict_many serves.
+        p_win = (p_f + 1.0 - p_r) / 2.0
 
         # ---- totals & spread (completed matches only) ---------------------
         trt = tr[tr["y_total_games"].notna()]
@@ -181,20 +239,23 @@ def run_backtest(start_season: int = 2010, run_tag: str | None = None,
             "level": te["level"].astype(str).to_numpy(),
             # Carried through so a pooled backtest can still be reported one
             # tour at a time -- the fit is shared, the reporting is not.
-            "tour": te["tour"].astype(str).to_numpy(),
+            "tour": tours,
             "is_challenger": te["is_challenger"].to_numpy(),
             "p1_id": te["p1_id"].to_numpy(),
             "p2_id": te["p2_id"].to_numpy(),
             "y_win": te["y_win"].to_numpy(),
             "p_win": p_win,
-            "p_win_raw": p_raw,
+            "p_win_raw": (raw_f + 1.0 - raw_r) / 2.0,
+            # One orientation each, so the asymmetry stays measurable.
+            "p_win_fwd": p_f,
+            "p_win_rev": p_r,
             "elo_prob": te["elo_prob"].to_numpy(),
             "y_total": te["y_total_games"].to_numpy(),
-            "pred_total": m_tot.predict(te[reg_feats]),
+            "pred_total": _symmetric_regression(m_tot, te, reg_feats),
             "y_total_sets": te["y_total_sets"].to_numpy(),
-            "pred_total_sets": m_set.predict(te[reg_feats]),
+            "pred_total_sets": _symmetric_regression(m_set, te, reg_feats),
             "y_spread": te["y_spread"].to_numpy(),
-            "pred_spread": m_spr.predict(te[reg_feats]),
+            "pred_spread": _symmetric_regression(m_spr, te, reg_feats, signed=True),
         }))
         log.info("  season %s: train=%d test=%d", season, len(tr), len(te))
 
@@ -219,6 +280,10 @@ def run_backtest(start_season: int = 2010, run_tag: str | None = None,
 def summarize(out: pd.DataFrame, t0: float | None = None) -> dict:
     y, p = out["y_win"].to_numpy(), out["p_win"].to_numpy()
     res = {"winner_overall": classification_metrics(y, p)}
+    if {"p_win_fwd", "p_win_rev"} <= set(out.columns):
+        # How far the single-orientation model is from p(A,B) + p(B,A) = 1.
+        res["antisymmetry_gap"] = round(float(np.mean(np.abs(
+            out["p_win_fwd"] + out["p_win_rev"] - 1.0))), 5)
 
     base = out["elo_prob"].to_numpy()
     ok = ~np.isnan(base)
@@ -246,18 +311,12 @@ def train_production_models(tour: str = "pooled") -> dict:
     win_feats = list(FEATURE_COLS)
     reg_feats = list(FEATURE_COLS) + abs_cols
 
-    # Same 85/15 split the backtest measures, so production is the setup that
-    # was evaluated. The calibrator is fitted on the held-out tail against a
-    # model that has not seen it; the *served* winner model is then refit on
-    # every row. Fitting only the first 90% left the model blind to the last
-    # 2+ years (it stopped at 2024-07) while the calibrator was the only thing
-    # that saw them.
-    cut = int(len(df) * 0.85)
-    fit, cal = df.iloc[:cut], df.iloc[cut:]
-    m_cal = _fit(WIN_PARAMS, fit, fit["y_win"].to_numpy(), win_feats,
-                 rounds=WIN_ROUNDS)
-    iso = IsotonicRegression(out_of_bounds="clip", y_min=0.01, y_max=0.99)
-    iso.fit(m_cal.predict(cal[win_feats]), cal["y_win"].to_numpy())
+    # The setup the backtest measures: the served booster is fitted on every
+    # row, and the calibrator on the last CAL_SEASONS seasons' out-of-fold
+    # predictions -- what the next fold's calibrator would be.
+    seasons = np.unique(season_of(df["tourney_date"].to_numpy()))
+    cal_seasons = [int(x) for x in seasons[-CAL_SEASONS:]]
+    iso = _calibrator_from(_oof_winner(df, win_feats, cal_seasons))
     m_win = _fit(WIN_PARAMS, df, df["y_win"].to_numpy(), win_feats,
                  rounds=WIN_ROUNDS)
 
@@ -274,6 +333,7 @@ def train_production_models(tour: str = "pooled") -> dict:
             "win_feats": win_feats, "reg_feats": reg_feats,
             "abs_features": ABS_FEATURES,
             "trained_through": int(df["tourney_date"].max()),
+            "calibrated_on_seasons": cal_seasons,
             "n_train": len(df), "tour": tour,
         }, fh)
 

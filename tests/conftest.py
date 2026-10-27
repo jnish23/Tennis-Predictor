@@ -36,3 +36,12 @@ def pytest_collection_modifyitems(config, items):
             item.add_marker(pytest.mark.skip(reason="no local database"))
         elif "features" in item.keywords and not have_feats:
             item.add_marker(pytest.mark.skip(reason="no features_atp.parquet"))
+
+
+@pytest.fixture(autouse=True)
+def _no_reviewed_aliases(monkeypatch, tmp_path):
+    """The reviewed-alias file is data, not logic. Tests of the duplicate-id
+    rules must see only the ids they construct, however many real merges the
+    file has accumulated."""
+    import tennis.ingest.load as load
+    monkeypatch.setattr(load, "ALIAS_CSV", tmp_path / "no_aliases.csv")

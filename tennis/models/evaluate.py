@@ -25,17 +25,35 @@ import pandas as pd
 
 from tennis.config import ARTIFACTS
 from tennis.db.schema import connect
+from tennis.ingest.parse import parse_score
 from tennis.models.common import (
-    brier,
     calibration_table,
     classification_metrics,
-    log_loss,
     regression_metrics,
+    season_of,
 )
+from tennis.models.stats import cluster_bootstrap_ratio, tourney_key_of
 
 log = logging.getLogger(__name__)
 
 VIG_PRICE = 1.909091  # -110 in decimal odds
+
+# Hyperparameters were tuned on 2019-2022 folds and reported on 2023+, but the
+# Elo constants and the feature subset were chosen by scoring the whole 2010+
+# walk-forward window, so no season already in the backtest is untouched. Matches
+# after this date are: nothing about the model has been selected on them. The
+# report breaks them out so the claim can be checked as they accrue. Moving this
+# date forward is the only legitimate way to retune.
+HOLDOUT_FROM = 2023
+SELECTION_FROZEN_ON = 20261026
+
+# How each book settles a moneyline bet when a match ends in retirement, as the
+# fewest completed sets after which the bet stands. Below it the stake is
+# returned. Pinnacle voids unless a full set was played; every other book here is
+# assumed to void all retirements (settling only on a completed match). These are
+# the books' published rules as understood when written -- check them before
+# trusting an ROI to the second decimal.
+RETIREMENT_MIN_SETS = {"PS": 1}
 
 
 def load_backtest(tour: str = "atp") -> pd.DataFrame:
@@ -76,6 +94,8 @@ def attach_odds(bt: pd.DataFrame, book: str = "PS",
         con, params=(book,))
     con.close()
     out = bt.merge(odds, on="match_id", how="left")
+    out = out.merge(_early_finishes(), on="match_id", how="left")
+    out["status"] = out["status"].fillna("completed")
     # Source stores prices on the actual winner; flip when p1 lost.
     out["p1_price"] = np.where(out["y_win"] == 1, out["win_price"], out["lose_price"])
     out["p2_price"] = np.where(out["y_win"] == 1, out["lose_price"], out["win_price"])
@@ -92,12 +112,62 @@ def attach_odds(bt: pd.DataFrame, book: str = "PS",
     return out
 
 
+def completed_sets(score, best_of=None) -> int:
+    """Sets actually finished in a score line, ignoring the one cut short.
+
+    The parser counts a set in progress when play stopped ("6-4 3-2 RET" reads
+    as two sets for the winner), which is right for a games total and wrong for
+    a bookmaker deciding whether the match got far enough to stand.
+    """
+    done = 0
+    for a, b in parse_score(score, best_of).sets:
+        hi, lo = max(a, b), min(a, b)
+        if (hi >= 6 and hi - lo >= 2) or (hi == 7 and lo in (5, 6)):
+            done += 1
+    return done
+
+
+def _early_finishes() -> pd.DataFrame:
+    """Status and completed sets for every match that did not finish normally."""
+    con = connect()
+    try:
+        m = pd.read_sql("SELECT match_id, status, score, best_of FROM matches "
+                        "WHERE status IN ('retired', 'default', 'unfinished')", con)
+    finally:
+        con.close()
+    m["sets_done"] = [completed_sets(sc, b) for sc, b in zip(m["score"], m["best_of"])]
+    return m[["match_id", "status", "sets_done"]]
+
+
+def voided(df: pd.DataFrame, book: str | None = None) -> np.ndarray:
+    """Rows whose moneyline bet the book would have refunded.
+
+    A retirement is a win on the scoreboard but only a bet for the books that
+    count it; settling every one at the closing price handed the model wins it
+    could not have been paid on and losses it could not have suffered.
+    """
+    if "status" not in df.columns:
+        return np.zeros(len(df), dtype=bool)
+    if book is None:
+        book = df["book"].iat[0] if "book" in df.columns and len(df) else None
+    status = df["status"].to_numpy()
+    done = df["sets_done"].fillna(0).to_numpy() if "sets_done" in df.columns \
+        else np.zeros(len(df))
+    need = RETIREMENT_MIN_SETS.get(book, np.inf)
+    return (status == "default") | (status == "unfinished") | \
+           ((status == "retired") & (done < need))
+
+
 # --------------------------------------------------------------------------
 # ROI
 # --------------------------------------------------------------------------
 def roi_winner(df: pd.DataFrame, edge: float = 0.03, stake: float = 1.0,
                kelly: bool = False, cap: float = 0.05) -> dict:
-    """Flat (or fractional-Kelly) staking on whichever side shows an edge."""
+    """Flat (or fractional-Kelly) staking on whichever side shows an edge.
+
+    Bets the book would void (see `voided`) are not bets: they return the stake
+    and count in `voided_matches`. The ROI interval resamples whole tournaments.
+    """
     d = df.dropna(subset=["p1_price", "p2_price", "p_win"]).copy()
     if d.empty:
         return {"bets": 0}
@@ -108,8 +178,11 @@ def roi_winner(df: pd.DataFrame, edge: float = 0.03, stake: float = 1.0,
     d["side"] = np.where(d["ev1"] >= d["ev2"], 1, 2)
     d["ev"] = np.maximum(d["ev1"], d["ev2"])
     d = d[d["ev"] > edge]
+    void = voided(d)
+    n_void_pool = int(void.sum())
+    d = d[~void]
     if d.empty:
-        return {"bets": 0}
+        return {"bets": 0, "voided_matches": n_void_pool}
 
     price = np.where(d["side"] == 1, d["p1_price"], d["p2_price"])
     p = np.where(d["side"] == 1, d["p_win"], 1 - d["p_win"])
@@ -124,11 +197,17 @@ def roi_winner(df: pd.DataFrame, edge: float = 0.03, stake: float = 1.0,
 
     profit = np.where(won, size * (price - 1), -size)
     turnover = size.sum()
+    # Without ids there is no way to tell which bets share an event.
+    clusters = (tourney_key_of(d["match_id"]).to_numpy() if "match_id" in d
+                else np.arange(len(d)))
+    lo, hi = cluster_bootstrap_ratio(profit, size, clusters)
     return {
         "bets": int(len(d)),
+        "voided_matches": n_void_pool,
         "turnover": round(float(turnover), 1),
         "profit": round(float(profit.sum()), 2),
         "roi_pct": round(float(profit.sum() / turnover * 100), 3) if turnover else 0.0,
+        "roi_ci95_tournament_pct": [round(lo * 100, 2), round(hi * 100, 2)],
         "hit_rate": round(float(won.mean()), 4),
         # The hit rate these bets would need to break even, which is what
         # `hit_rate` should be read against -- never 50%. Edge betting takes the
@@ -151,7 +230,7 @@ def roi_by_season(df: pd.DataFrame, edge: float = 0.03) -> list[dict]:
     the honest read on how noisy the headline is.
     """
     out = []
-    for season, g in df.groupby(df["tourney_date"] // 10000):
+    for season, g in df.groupby(season_of(df["tourney_date"].to_numpy())):
         r = roi_winner(g, edge=edge)
         if r.get("bets"):
             out.append({"season": int(season), **r})
@@ -166,7 +245,7 @@ def _reference_line(df: pd.DataFrame, col: str) -> pd.Series:
     a row's line include other matches of its own event, in an arbitrary order.
     """
     d = df[["surface", "is_challenger", "tourney_date", col]].copy()
-    d["season"] = d["tourney_date"] // 10000
+    d["season"] = season_of(d["tourney_date"].to_numpy())
     g = (d.groupby(["surface", "is_challenger", "season"], observed=True)[col]
            .agg(["sum", "count"]).reset_index().sort_values("season"))
     keys = ["surface", "is_challenger"]
@@ -310,6 +389,25 @@ def _verdict(rep: dict, best_roi: float, beats_close: bool | None) -> str:
     return " ".join(parts)
 
 
+def _selection_windows(bt: pd.DataFrame) -> dict:
+    """Winner metrics split by how much of the window the model was selected on.
+
+    `dev` is before HOLDOUT_FROM, `holdout` is after it, and `post_freeze` is
+    after SELECTION_FROZEN_ON. Only the last was never scored while Elo
+    constants or features were being chosen, so only it is a clean out-of-sample
+    figure; the others are in-sample to those choices, if mildly.
+    """
+    season = season_of(bt["tourney_date"].to_numpy())
+    windows = {"dev": season < HOLDOUT_FROM, "holdout": season >= HOLDOUT_FROM,
+               "post_freeze": bt["tourney_date"].to_numpy() > SELECTION_FROZEN_ON}
+    out: dict = {"holdout_from": HOLDOUT_FROM, "frozen_on": SELECTION_FROZEN_ON}
+    for k, m in windows.items():
+        out[k] = (classification_metrics(bt.loc[m, "y_win"].to_numpy(),
+                                         bt.loc[m, "p_win"].to_numpy())
+                  if m.sum() >= 100 else {"n": int(m.sum())})
+    return out
+
+
 def full_report(book: str = "PS", tour: str = "atp") -> dict:
     bt = load_backtest(tour)
     bt["tour_level"] = np.where(bt["is_challenger"] == 1, "challenger", "main_tour")
@@ -325,6 +423,8 @@ def full_report(book: str = "PS", tour: str = "atp") -> dict:
             y[~np.isnan(bt["elo_prob"])], bt["elo_prob"].dropna().to_numpy()),
         "calibration": calibration_table(y, p).to_dict("records"),
     }
+
+    rep["selection_windows"] = _selection_windows(bt)
 
     t = bt.dropna(subset=["y_total"])
     rep["totals_games"] = regression_metrics(t["y_total"].to_numpy(), t["pred_total"].to_numpy())
@@ -348,6 +448,17 @@ def full_report(book: str = "PS", tour: str = "atp") -> dict:
             "model": classification_metrics(mk["y_win"].to_numpy(), mk["p_win"].to_numpy()),
             "market_closing": classification_metrics(
                 mk["y_win"].to_numpy(), mk["mkt_p1"].to_numpy()),
+        }
+    if not mk.empty:
+        # Retirements are real results but noisy ones, and a market that prices
+        # them as ordinary matches is scored on them too. Reported apart so the
+        # headline cannot be read as either cleaner or worse than it is.
+        cm = mk[mk["status"] == "completed"]
+        rep["market_subset"]["completed_only"] = {
+            "n": int(len(cm)),
+            "model": classification_metrics(cm["y_win"].to_numpy(), cm["p_win"].to_numpy()),
+            "market_closing": classification_metrics(
+                cm["y_win"].to_numpy(), cm["mkt_p1"].to_numpy()),
         }
     rep["roi_winner"] = {
         f"edge_{e:.2f}": roi_winner(withodds, edge=e) for e in (0.0, 0.03, 0.05, 0.10)
@@ -404,7 +515,7 @@ def full_report(book: str = "PS", tour: str = "atp") -> dict:
 
     for dim in ("surface", "level", "tour_level", "tour"):
         rep[f"by_{dim}"] = breakout(bt, dim).to_dict("records")
-    bt["season"] = bt["tourney_date"] // 10000
+    bt["season"] = season_of(bt["tourney_date"].to_numpy())
     rep["by_season"] = breakout(bt, "season").to_dict("records")
 
     (ARTIFACTS / f"backtest_report_{tour}.json").write_text(

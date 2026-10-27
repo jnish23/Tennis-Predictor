@@ -35,42 +35,52 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 
 ## What the numbers say
 
-Walk-forward over 2010–2026, 127,132 ATP matches, each season predicted by a model
-trained only on earlier matches.
+Walk-forward over 2010–2026, 127,587 ATP matches, each season predicted by a model
+trained only on earlier matches and scored in both player orientations, as it is
+served. (Last regenerated 2026-10-26.)
 
 | | value |
 |---|---|
-| Log loss | **0.6047** (Elo-only baseline 0.6263) |
-| Brier | **0.2094** |
-| Accuracy | **66.4%** |
-| Totals MAE | **5.16 games** |
-| Spread MAE | **4.09 games** |
+| Log loss | **0.6024** (Elo-only baseline 0.6263) |
+| Brier | **0.2086** |
+| Accuracy | **66.6%** |
+| Totals MAE | **5.09 games** |
+| Spread MAE | **4.08 games** |
 | Total-sets MAE | 0.47 sets |
 
 Calibration is close to the diagonal across the full probability range.
 
-**The model does not beat the closing line.** On the 38,422 matches with
-Pinnacle prices, the closing line's log loss is 0.5730 against the model's
-0.5859, and flat-staking every positive-EV bet loses money at every edge
-threshold tested (best −3.06%, worst −4.00%). Split by
-season, 2 of 16 full seasons are profitable (best 2017, +8.3%; worst 2023,
-−14.0%). This is the expected result — tennis closing lines are sharp — and it
-is the honest headline: treat this as a calibrated probability source, not a
-betting edge.
+None of these seasons is clean out-of-sample: the Elo constants and the feature
+subset were chosen on windows that included 2023+, so the report splits the
+winner metrics into development (before 2023, log loss 0.5954), holdout (2023+,
+0.6203) and post-freeze (matches after 2026-10-26, none yet). Only the last is
+untouched by selection. The experiment tables further down were produced under
+earlier definitions of the rest features and the calibrator and have not been
+re-run.
 
-**Hit rate is not accuracy, and its benchmark is not 50%.** Accuracy (66.5%)
-asks whether the model's favourite won, across every match. Hit rate (41.0% at
+**The model does not beat the closing line.** On the 38,416 matches with
+Pinnacle prices, the closing line's log loss is 0.5729 against the model's
+0.5838, and flat-staking every positive-EV bet loses money at every edge
+threshold tested (best −2.96%, worst −4.98%; tournament-clustered 95% intervals
+all below zero). Retirements are settled as Pinnacle settles them, not as
+ordinary wins. Split by season, 3 of 16 full seasons are profitable (best 2017,
++8.2%; worst 2020, −12.2%). This is the expected result — tennis closing lines
+are sharp — and it is the honest headline: treat this as a calibrated
+probability source, not a betting edge.
+
+**Hit rate is not accuracy, and its benchmark is not 50%.** Accuracy (66.6%)
+asks whether the model's favourite won, across every match. Hit rate (41.1% at
 edge 0.03) asks whether the *value side* won, on the subset where the model
-disagreed with the price — and 69% of those bets are on the market underdog at
-an average price of 3.75. Most are meant to lose. The benchmark is the price:
-break-even is mean(1/price) = 41.7%, so the model lands **0.64 points short**,
-which is precisely the −2.91% ROI. The report and dashboard both carry
+disagreed with the price — and 69.5% of those bets are on the market underdog at
+an average price of 3.66. Most are meant to lose. The benchmark is the price:
+break-even is mean(1/price) = 41.6%, so the model lands **0.47 points short**,
+which is the −3.00% ROI. The report and dashboard both carry
 `breakeven_hit_rate` beside `hit_rate` so the two are never read apart. Note
 that 1/mean(price) is *not* the break-even and understates it badly on a skewed
 book — `tests/test_pipeline.py` pins the correct formula.
 
-Accuracy is meaningfully higher on main tour (68.3%) than Challenger (64.8%),
-and highest on Grand Slams (74.5%), where best-of-five and large skill gaps make
+Accuracy is meaningfully higher on main tour (68.8%) than Challenger (65.3%),
+and highest on Grand Slams (75.2%), where best-of-five and large skill gaps make
 matches more predictable.
 
 ## Layout
@@ -156,7 +166,16 @@ Three findings that shape what the system can claim:
 - **Retirements, walkovers and defaults are labelled, not dropped.** A
   retirement is a real win, so it counts for the winner model and for Elo; but
   its scoreline is truncated, so it is flagged `totals_usable=0` and never
-  becomes a totals or spread label. Walkovers update nothing — no play happened.
+  becomes a totals or spread label. Walkovers, defaults and unfinished matches
+  update nothing and never reach a model: no result worth learning from. In the
+  ROI backtest a retirement is settled the way the book settles it (Pinnacle
+  voids unless a full set was played, other books void it outright; see
+  `RETIREMENT_MIN_SETS` in `evaluate.py`).
+- **Matches are dated by when they were played.** The archived files stamp every
+  match with the Monday its event began, which made every later-round opponent
+  look to have had zero rest. Where the true day is known (`date_is_exact`) it is
+  used; otherwise the day is placed by round and event shape (`_ROUND_DAY` in
+  `features/build.py`). `tourney_date` stays the event start, for grouping.
 - **Categorical encodings differ from the CLAUDE.md description.** The live
   files use `250/500/M/G/D/A/O/F/C` for `tourney_level` (not `A/G/D/F`) and
   `I/O` for indoor (not Yes/No). Both are mapped to a stable internal vocabulary
@@ -182,6 +201,24 @@ interaction on its own. A *player-specific* lefty effect does exist — 581
 players with ≥20 matches vs a lefty show z-score sd 1.056 against 1.000 expected,
 χ² p = 0.023 — but it is small, and with 20–50 such matches per player a
 "win rate vs lefties" feature would be mostly noise. Not added.
+
+**Second batch (walk-forward 2012–2026, paired bootstrap by match,
+`scripts/experiment_feature_batch.py`).** Deltas are log loss for the winner
+and MAE in games for totals and spread; negative is better.
+
+| change | winner | totals | spread | verdict |
+|---|---|---|---|---|
+| `best_of` actually reaching the model (was NaN in every row) | −0.00018 (noise) | **−0.051** (15/15 seasons) | −0.001 (noise) | **kept** |
+| real tiebreak win rate (was a match win rate) | +0.00015 (noise) | −0.001 | −0.001 | kept, as it is the correct definition |
+| shrink decider / tiebreak / career rates toward 0.5 | 0.000 | −0.0002 | −0.0002 | not adopted |
+| tournament speed index (prior seasons only) | +0.00022 | −0.001 | −0.0005 | not adopted |
+| symmetric serve features (totals/spread only) | n/a | −0.002 | +0.0001 | not adopted |
+| opponent-adjusted serve/return EWMAs | −0.00004 | −0.0002 | −0.0025 (12/15) | not adopted: 0.06% of MAE |
+| surface-specific serve/return EWMAs | +0.0002 | −0.0036 (12/15) | −0.0014 | not adopted: 0.07% of MAE |
+
+The candidate columns are still computed by the engine and written to the
+features parquet, but are not in `FEATURE_COLS`. Of twelve comparisons, the two
+that cleared their CI are tiny, which is about what chance alone produces.
 
 **Four feature groups were A/B'd** on a 2023+ holdout. Individually none cleared
 noise; together they did:
@@ -307,61 +344,66 @@ regression, which is a concrete argument for implementing Shin devigging before
 treating the non-replication as settled.
 
 **The models show real closing-line value — an order of magnitude short of
-profitable.** Placing one bet per match at Pinnacle's *opening* games line and
-scoring it against the close (`scripts/backtest_lines.py` and the CLV analysis
-alongside it):
+profitable.** Placing bets at Pinnacle's *opening* games line and scoring them
+against the close (`models/lines.py::clv`, `scripts/backtest_lines.py`). A ladder
+quotes 6–12 lines on one match, so which line is scored matters:
 
-| market | bets | mean CLV | 95% CI | beat the close | z |
-|---|---|---|---|---|---|
-| totals | 12,917 | **+0.33 pts** | [+0.29, +0.37] | 52.9% | +6.6 |
-| spread | 14,979 | **+1.11 pts** | [+1.05, +1.17] | 60.6% | +25.9 |
+| market | matches | every rung, per match (headline) | 95% CI | beat the close | best-EV rung | rung nearest even money |
+|---|---|---|---|---|---|---|
+| totals | 12,528 | **+0.27 pts** | [+0.21, +0.33] | 52.8% | +0.49 | +0.33 |
+| spread | 15,105 | **+0.67 pts** | [+0.61, +0.74] | 57.4% | +1.07 | +0.75 |
 
-CLV is the right success metric because it scores every bet rather than only
-the ones that won, and it is what the market itself later agrees with. Both are
-overwhelmingly significant, both CIs exclude zero by a wide margin, and CLV
-*rises* with the edge threshold (totals: +0.298 at edge 0, +0.331 at 2%, +0.359
-at 5%), which is what signal looks like and noise does not.
+The headline averages every line the model likes within a match, then averages
+across matches. The *best-EV* column — the single line where the model most
+disagrees with the opening price — looks better but is not evidence of skill:
+choosing the line with the largest disagreement picks out the stalest opening
+quote, which drifts back toward fair by the close whatever the model knows. It
+is what a bettor taking that line would have scored, not a measure of the model,
+so it is reported but not headlined. Handicap ladders are oriented on their
+opening prices, so the close never decides whose side a line is on, and the
+intervals resample whole tournaments rather than bets.
 
-It is still not enough. The vig on those same lines is **3.5-3.8 points**, so
-totals covers about a tenth of what it needs and spread about a third. The ROI
-figures agree: against Pinnacle's tighter 4.0% margin, totals runs -1.79% to
--0.24% and spread -0.55% to +0.63%, with every confidence interval spanning
-zero. Against the cross-book average at 7.3% vig both are clearly negative
-(-2.8% and -4.3%), though still well ahead of backing every over (-8.9%) or
-every under (-6.4%), so the model is extracting real value from the ladder --
-just less than the house charges to play.
+The CLV is real: the market moves toward the model more often than not, and the
+interval excludes zero. It is still not enough. The vig on those same lines is
+**3.4–3.8 points**, so totals covers about a twelfth of what it needs and spread
+about a fifth. ROI at the opening-based prices agrees (cross-book average, 7.2–7.3%
+median vig): on the line nearest even money totals runs −3.4% to −3.7% and spread
+−5.7% to −6.3%, with intervals mostly excluding zero; backing every positive-EV
+rung is worse (totals −3.82%, spread −6.90%), though all still beat blindly
+backing every over (−9.1%) or every under (−6.2%) on totals. The best-EV-rung ROI
+(totals −1.0% to +1.7%, every interval spanning zero) is the winner's-curse
+figure above and should not be read as a near-breakeven strategy.
 
-Two practical notes. Betting **every** positive-EV rung rather than the single
-best one costs about two points (totals -4.74% against -2.77%), because a ladder
-is a menu, not a dozen independent bets; for the same reason every interval here
-is bootstrapped **by match**, since rungs on one match settle on one scoreline.
-And some of the CLV may be timing rather than modelling: our features are
-as-of-match while an opening line can be days old, so part of what looks like
-foresight is simply more recent information.
+Two practical notes. A ladder is a menu, not a dozen independent bets; every
+interval here is bootstrapped by **tournament**, since rungs on one match settle
+on one scoreline and matches in one event share a court and a draw. And some of
+the CLV may be timing rather than modelling: our features are as-of-match while
+an opening line can be days old, so part of what looks like foresight is simply
+more recent information.
 
 **Totals and spread, measured against a market for the first time.** On
-29,158 matches (2023–2026) with residual distributions fitted only on earlier
-seasons, the market wins both — but by less than the framing "MAE 5.17 games"
+29,396 matches (2023–2026) with residual distributions fitted only on earlier
+seasons, the market wins both — but by less than the framing "MAE 5.09 games"
 suggests, and by almost exactly the margin the winner model concedes:
 
 | market | n (match-lines) | model | market | gap |
 |---|---|---|---|---|
-| totals (games) | 370,452 | 0.66050 | 0.65000 | **+0.0105** |
-| — Challenger | 199,113 | 0.66498 | 0.66124 | **+0.0037** |
-| — main tour | 171,339 | 0.65530 | 0.63693 | +0.0184 |
-| spread (games) | 345,843 | 0.64847 | 0.63297 | **+0.0155** |
-| — Challenger | 197,943 | 0.66911 | 0.65363 | +0.0155 |
-| — main tour | 147,900 | 0.62085 | 0.60533 | +0.0155 |
+| totals (games) | 376,775 | 0.65311 | 0.64928 | **+0.0038** |
+| — Challenger | 202,762 | 0.66407 | 0.66127 | **+0.0028** |
+| — main tour | 174,013 | 0.64034 | 0.63530 | +0.0050 |
+| spread (games) | 351,390 | 0.64708 | 0.63213 | **+0.0150** |
+| — Challenger | 201,463 | 0.67046 | 0.65379 | +0.0167 |
+| — main tour | 149,927 | 0.61566 | 0.60303 | +0.0126 |
 
-For scale the winner model concedes 0.0135 to Pinnacle, so all three models sit
+For scale the winner model concedes 0.0109 to Pinnacle, so all three models sit
 a comparable distance behind their own market. The Challenger totals gap of
-0.0037 is the smallest of any comparison in this project, and it is the third
+0.0028 is the smallest of any comparison in this project, and it is the third
 independent market on which the Challenger-versus-main-tour pattern has shown
 up.
 
 Getting there needed two orientation traps fixed, both worth knowing about
-before touching `odds_quotes`. The k1/k2 columns are **winner-first** (99.8% of
-resolved matches), while the handicap `line` is quoted against a *pre-match*
+before touching `odds_quotes`. The k1/k2 columns are **winner-first** (99.6% of
+resolved matches, not all of them), while the handicap `line` is quoted against a *pre-match*
 ordering, so the two agree only 51% of the time — pooled, that cancelled the
 signal to a correlation of +0.09 and a market that scored worse than a coin
 flip. The ladder's own direction identifies whose frame the line is in, which
@@ -496,7 +538,7 @@ pairwise differences of all of the above. 126 columns.
 
 | target | type | note |
 |---|---|---|
-| winner | LightGBM binary + isotonic calibration | calibrator fitted on a held-out *earlier* slice, never on test data |
+| winner | LightGBM binary + isotonic calibration | booster fitted on every earlier row; one isotonic curve per tour, fitted on the previous 3 seasons' out-of-fold predictions, never on test data. Both orientations of each match are scored and averaged, in the backtest as in serving |
 | totals | LightGBM regression on **total games** | |
 | spread | LightGBM regression on signed game margin | p1-relative |
 

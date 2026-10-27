@@ -1,0 +1,61 @@
+name: keepalive
+
+# Two jobs, because two different things switch the site off:
+#
+# 1. Streamlit Community Cloud sleeps an idle app. A plain GET returns the
+#    "app has gone to sleep" page, so wake it with a headless browser that
+#    clicks the button. Needs the repository variable APP_URL.
+# 2. GitHub disables scheduled workflows after 60 days without repository
+#    activity, which would silently stop daily/weekly/odds. Re-enabling a
+#    workflow through the API restarts that clock; this run does it for them.
+
+on:
+  schedule:
+    - cron: "17 */6 * * *"
+  workflow_dispatch:
+
+permissions:
+  actions: write               # re-enable the scheduled workflows
+
+jobs:
+  wake:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Check APP_URL is set
+        id: cfg
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          if [ -z "$APP_URL" ]; then
+            echo "::warning::Repository variable APP_URL is not set; nothing to wake."
+            echo "skip=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - uses: actions/setup-python@v5
+        if: steps.cfg.outputs.skip != 'true'
+        with:
+          python-version: "3.13"
+
+      - name: Wake the app
+        if: steps.cfg.outputs.skip != 'true'
+        env:
+          APP_URL: ${{ vars.APP_URL }}
+        run: |
+          pip install playwright
+          playwright install --with-deps chromium
+          python scripts/wake_app.py "$APP_URL"
+
+  keep-schedules-enabled:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    env:
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Re-enable scheduled workflows
+        run: |
+          for wf in daily.yml weekly.yml odds.yml keepalive.yml; do
+            gh workflow enable "$wf" --repo "$GITHUB_REPOSITORY" || true
+          done

@@ -30,8 +30,9 @@ import logging
 import numpy as np
 import pandas as pd
 
-from tennis.models.common import log_loss
+from tennis.models.common import log_loss, season_of
 from tennis.models.devig import shin
+from tennis.models.stats import cluster_bootstrap_mean, tourney_key_of
 
 log = logging.getLogger(__name__)
 
@@ -84,6 +85,16 @@ def _orient_ladder(agg: pd.DataFrame) -> pd.DataFrame:
     return agg.drop(columns="rho")
 
 
+def _ours(d: pd.DataFrame) -> np.ndarray:
+    """True where the backtest's p1 is tennisexplorer's first player (k1).
+
+    k1 is the winner 99.6% of the time, not always; where it is not, our p1 is
+    k1 exactly when our p1 also lost. Both orderings know who won, which is all
+    that is needed to line them up.
+    """
+    return (d.y_win.to_numpy() == 1) == (d.p1_is_winner.to_numpy() == 1)
+
+
 class EmpiricalResiduals:
     """P(actual > line) from the empirical residual distribution.
 
@@ -132,12 +143,12 @@ class EmpiricalResiduals:
 
 
 def _frame(market, pred, actual, con, bt, book=None) -> pd.DataFrame:
-    tm = pd.read_sql("SELECT te_id, match_id FROM te_matches "
-                     "WHERE match_id IS NOT NULL", con)
+    tm = pd.read_sql("SELECT te_id, match_id, p1_is_winner FROM te_matches "
+                     "WHERE match_id IS NOT NULL AND p1_is_winner IS NOT NULL", con)
     mb = pd.read_sql("SELECT match_id, best_of, totals_usable FROM matches", con)
     base = bt.merge(tm, on="match_id").merge(mb, on="match_id")
     base = base[base.totals_usable == 1]
-    base["season"] = base.tourney_date // 10000
+    base["season"] = season_of(base.tourney_date.to_numpy())
 
     mkt = load_market(market, con, book=book)
     if mkt.empty:
@@ -151,7 +162,7 @@ def _frame(market, pred, actual, con, bt, book=None) -> pd.DataFrame:
     if market == "totals":
         d["line_ours"], d["p_mkt_ours"] = d.line, d.p_mkt
     else:
-        ours = d.y_win.to_numpy() == 1
+        ours = _ours(d)
         d["line_ours"] = np.where(ours, d.line, -d.line)
         d["p_mkt_ours"] = np.where(ours, d.p_mkt, 1 - d.p_mkt)
     d["p_model"] = emp.p_over(d.best_of.to_numpy(), d[pred].to_numpy(),
@@ -200,6 +211,22 @@ def market_comparison(con, bt: pd.DataFrame) -> dict:
     return out
 
 
+def _clv_view(g: pd.DataFrame) -> dict:
+    """CLV in points over one bet per match, with a tournament-clustered interval.
+
+    `g` has one row per match carrying `clv` (points, positive when the close
+    moved toward the side taken) and `match_id`.
+    """
+    v = g.clv.to_numpy()
+    lo, hi = cluster_bootstrap_mean(v, tourney_key_of(g.match_id).to_numpy())
+    return {
+        "bets": int(len(g)),
+        "mean_clv_pts": round(float(v.mean()), 3),
+        "ci95_tournament_pts": [round(lo, 3), round(hi, 3)],
+        "beat_close_pct": round(float((v > 0).mean()) * 100, 1),
+    }
+
+
 def clv(con, bt: pd.DataFrame, book: str = "Pinnacle", edge: float = 0.02) -> dict:
     """Closing-line value on bets placed at the opening price.
 
@@ -207,6 +234,19 @@ def clv(con, bt: pd.DataFrame, book: str = "Pinnacle", edge: float = 0.02) -> di
     only the ones that won. Reported beside the vig deliberately: a positive CLV
     of a third of a point against a 3.5 point margin is signal, not profit, and
     the two numbers are meaningless apart.
+
+    **Which rung.** A ladder is 6-12 prices on one match. Taking the single
+    rung with the largest model edge picks out the stalest opening quote, which
+    reverts toward fair by the close whatever the model knows: a model that is
+    the opening price plus noise scores positive CLV that way. So the headline
+    is every qualifying rung, averaged within the match and then across matches.
+    The max-EV rung is still reported (`max_ev_rung`) because it is what a
+    bettor taking the best price would get, and the rung nearest even money
+    (`main_line`) because that is where the liquidity is; neither is the
+    headline, and the first is flattered by its own selection.
+
+    The handicap ladder is oriented on its *opening* prices: the bet is placed
+    at the open, so the close must not decide whose frame a line is in.
     """
     out: dict = {"book": book, "edge": edge, "markets": {}}
     for label, market, pred, actual in (
@@ -227,24 +267,24 @@ def clv(con, bt: pd.DataFrame, book: str = "Pinnacle", edge: float = 0.02) -> di
             continue
         q["p_open"] = shin(q[["op1", "op2"]].to_numpy(float))[0][:, 0]
         q["p_close"] = shin(q[["cl1", "cl2"]].to_numpy(float))[0][:, 0]
-        q["p_mkt"] = q.p_close
+        q["p_mkt"] = q.p_open
         q["overround"] = 1 / q.cl1 + 1 / q.cl2
         if market == "handicap":
             q = _orient_ladder(q)
 
-        tm = pd.read_sql("SELECT te_id, match_id FROM te_matches "
-                         "WHERE match_id IS NOT NULL", con)
+        tm = pd.read_sql("SELECT te_id, match_id, p1_is_winner FROM te_matches "
+                         "WHERE match_id IS NOT NULL AND p1_is_winner IS NOT NULL", con)
         mb = pd.read_sql("SELECT match_id, best_of, totals_usable FROM matches", con)
         base = bt.merge(tm, on="match_id").merge(mb, on="match_id")
         base = base[base.totals_usable == 1]
-        base["season"] = base.tourney_date // 10000
+        base["season"] = season_of(base.tourney_date.to_numpy())
         emp = EmpiricalResiduals(base[base.season < FIT_BEFORE], pred, actual)
         d = base.merge(q, on="te_id").dropna(subset=[pred, actual])
         d = d[d.season >= FIT_BEFORE].copy()
         if d.empty:
             continue
         if market == "handicap":
-            ours = d.y_win.to_numpy() == 1
+            ours = _ours(d)
             d["line"] = np.where(ours, d.line, -d.line)
             o1, o2 = d.op1.to_numpy(), d.op2.to_numpy()
             c1, c2 = d.cl1.to_numpy(), d.cl2.to_numpy()
@@ -256,23 +296,33 @@ def clv(con, bt: pd.DataFrame, book: str = "Pinnacle", edge: float = 0.02) -> di
                                   d.line.to_numpy())
         ev1 = d.p_model * d.op1 - 1
         ev2 = (1 - d.p_model) * d.op2 - 1
-        g = d.assign(side1=ev1 >= ev2, ev=np.maximum(ev1, ev2))
-        # One bet per match: a ladder is a menu, not a dozen independent bets.
-        g = g[g.ev > edge].sort_values("ev", ascending=False)
-        g = g.drop_duplicates("match_id")
+        d = d.assign(side1=ev1 >= ev2, ev=np.maximum(ev1, ev2))
+        # Points the close moved toward the side taken.
+        d["clv"] = np.where(d.side1, d.p_close - d.p_open, d.p_open - d.p_close) * 100
+
+        qual = d[d.ev > edge]
+        # Headline: every qualifying rung, equal weight per match.
+        g = qual.groupby("match_id", as_index=False).clv.mean()
         if len(g) < 200:
             continue
-        po = np.where(g.side1, g.p_open, 1 - g.p_open)
-        pc = np.where(g.side1, g.p_close, 1 - g.p_close)
-        v = (pc - po) * 100
-        beat = float((v > 0).mean())
+        v = _clv_view(g)
+        # The highest-edge rung per match, and the rung nearest even money.
+        v["max_ev_rung"] = _clv_view(
+            qual.sort_values("ev", ascending=False).drop_duplicates("match_id"))
+        main = (d.assign(dist=(d.p_open - 0.5).abs())
+                 .sort_values("dist").drop_duplicates("match_id"))
+        main = main[main.ev > edge]
+        if len(main) >= 200:
+            v["main_line"] = _clv_view(main)
+        lo, hi = v["ci95_tournament_pts"]
+        se = (hi - lo) / 3.92
         out["markets"][label] = {
-            "bets": int(len(g)),
-            "mean_clv_pts": round(float(v.mean()), 3),
-            "se_pts": round(float(v.std(ddof=1) / np.sqrt(len(v))), 3),
-            "beat_close_pct": round(beat * 100, 1),
-            "z": round(float((beat - 0.5) / np.sqrt(0.25 / len(v))), 1),
+            **v,
+            "selection": "every qualifying rung, equal weight per match",
+            "se_pts": round(se, 3),
+            # mean over its tournament-clustered standard error
+            "z": round(v["mean_clv_pts"] / se, 1) if se > 0 else float("nan"),
             "vig_to_overcome_pts": round(
-                float((1 - 1 / (1 / g.cl1 + 1 / g.cl2).median()) * 100), 2),
+                float((1 - 1 / (1 / qual.cl1 + 1 / qual.cl2).median()) * 100), 2),
         }
     return out

@@ -23,11 +23,13 @@ from tennis.models.common import CATEGORICAL, prepare
 def event_week_start(today: date | None = None) -> int:
     """Monday of the current week, as YYYYMMDD.
 
-    Training stamps every match in an event with the week it began, so rest days
-    and the 14/30-day match counts are measured *from the event start*. A live
-    prediction dated "today" measures them from a different origin and shifts
-    every rest feature the model was trained on. Defaulting to the week's
-    Monday keeps the two on the same footing.
+    The fallback for a context that names no day (a bracket simulated before it
+    is played, a hypothetical). Training dates each match by the day it was
+    played -- exactly where known, otherwise by round within the event -- so a
+    caller who knows the day should pass it as `tourney_date`; the dashboard's
+    betting page does. Without one, the week's Monday is the event-start origin
+    the bracket simulator already freezes features at, and never a hard-coded
+    date.
     """
     d = today or date.today()
     return int((d - timedelta(days=d.weekday())).strftime("%Y%m%d"))
@@ -188,8 +190,13 @@ class Predictor:
             df[c] = df[c].astype("category")
 
         raw = self.m["winner"].predict(df[self.m["win_feats"]])
+        cal = self.m["calibrator"]
+        # A per-tour calibrator takes the tour; a plain isotonic regression,
+        # as saved before calibration was split by tour, does not.
+        win = (cal.predict(raw, df["tour"].astype(str).to_numpy())
+               if hasattr(cal, "by_tour") else cal.predict(raw))
         return {
-            "win": np.asarray(self.m["calibrator"].predict(raw), dtype=float),
+            "win": np.asarray(win, dtype=float),
             "total": np.asarray(self.m["totals"].predict(df[self.m["reg_feats"]]), dtype=float),
             "sets": np.asarray(self.m["totals_sets"].predict(df[self.m["reg_feats"]]), dtype=float),
             "spread": np.asarray(self.m["spread"].predict(df[self.m["reg_feats"]]), dtype=float),

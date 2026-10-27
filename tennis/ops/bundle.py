@@ -27,6 +27,7 @@ import shutil
 import sqlite3
 import tarfile
 import tempfile
+import threading
 import time
 from datetime import datetime, timezone
 from pathlib import Path
@@ -43,9 +44,11 @@ log = logging.getLogger(__name__)
 # `te_matches`, `te_scrape_log`, `features`, `backtest`, `draws`, `sim_results`
 # and `predictions` are research or scratch tables: the slim file carries them
 # empty (the schema is created whole) so a stray query returns no rows rather
-# than failing.
+# than failing. `odds` is in that group on purpose: the dashboard only ever
+# counted it (25 MB for a status-page number), so its two counts travel in
+# serve_meta.json instead -- see `odds_summary`.
 SERVE_TABLES = (
-    "matches", "players", "tournaments", "rankings", "elo_state", "odds",
+    "matches", "players", "tournaments", "rankings", "elo_state",
     "odds_snapshots", "pipeline_state", "tourney_xref", "feed_player_xref",
     "player_alias",
 )
@@ -242,6 +245,19 @@ def build_slim_db(src: Path, dest: Path) -> dict[str, int]:
     return counts
 
 
+def odds_summary(con: sqlite3.Connection) -> dict:
+    """Price rows, and distinct priced matches, for the status page.
+
+    `odds` holds one row per (match, bookmaker), so the two differ.
+    """
+    try:
+        rows, matches = con.execute(
+            "SELECT COUNT(*), COUNT(DISTINCT match_id) FROM odds").fetchone()
+    except sqlite3.Error:
+        rows = matches = 0
+    return {"rows": rows, "matches": matches}
+
+
 def pack_serve(out: Path, *, db_path: Path = DB_PATH, data: Path = DATA,
                artifacts: Path = ARTIFACTS) -> dict:
     out = Path(out)
@@ -253,7 +269,13 @@ def pack_serve(out: Path, *, db_path: Path = DB_PATH, data: Path = DATA,
             max_date = con.execute("SELECT MAX(tourney_date) FROM matches").fetchone()[0]
         finally:
             con.close()
-        meta = {"built_at": _now(), "max_tourney_date": max_date, "rows": counts}
+        src = sqlite3.connect(str(db_path))
+        try:
+            odds = odds_summary(src)
+        finally:
+            src.close()
+        meta = {"built_at": _now(), "max_tourney_date": max_date, "rows": counts,
+                "odds": odds}
         meta_path = Path(td) / SERVE_META
         meta_path.write_text(json.dumps(meta, indent=2))
         with _tar_writer(out) as tar:
@@ -340,6 +362,61 @@ def fetch_serve(url: str, *, data: Path = DATA, artifacts: Path = ARTIFACTS) -> 
             os.replace(stage / "data" / SERVE_META, data / SERVE_META)
             log.info("fetched serve bundle in %.0fs", time.time() - t0)
     return local_meta(data) or {}
+
+
+# --------------------------------------------------------------------------
+# background refresh
+# --------------------------------------------------------------------------
+BG_RETRY_S = 600.0
+_bg_lock = threading.Lock()
+_bg: dict = {"thread": None, "error": None, "failed_at": 0.0, "seen": None}
+
+
+def start_background_fetch(url: str, *, data: Path = DATA,
+                           artifacts: Path = ARTIFACTS) -> str:
+    """Refresh the serve bundle on a daemon thread; never blocks the caller.
+
+    Returns 'running' (one is already in flight), 'started', or 'backoff' (the
+    last attempt failed less than BG_RETRY_S ago, so a flapping download is not
+    retried on every page rerun). The thread only moves files; it does not
+    touch any Streamlit cache -- the caller drops those on a later rerun, once
+    `bundle_changed` says the new copy is in place.
+    """
+    with _bg_lock:
+        t = _bg["thread"]
+        if t is not None and t.is_alive():
+            return "running"
+        if _bg["error"] and time.time() - _bg["failed_at"] < BG_RETRY_S:
+            return "backoff"
+
+        def work():
+            try:
+                fetch_serve(url, data=data, artifacts=artifacts)
+                _bg["error"] = None
+            except Exception as exc:  # noqa: BLE001 - surfaced via background_error
+                log.warning("background refresh failed: %s", exc)
+                _bg["error"] = str(exc)
+                _bg["failed_at"] = time.time()
+
+        _bg["thread"] = threading.Thread(target=work, name="serve-refresh", daemon=True)
+        _bg["thread"].start()
+        return "started"
+
+
+def background_error() -> str | None:
+    return _bg["error"]
+
+
+def bundle_changed(data: Path = DATA) -> bool:
+    """True once, the first time a different `built_at` is seen than last call.
+
+    The first call only records a baseline. Process-wide on purpose: Streamlit's
+    caches are shared by every session in the process, so one clear is enough.
+    """
+    built = (local_meta(data) or {}).get("built_at")
+    with _bg_lock:
+        prev, _bg["seen"] = _bg["seen"], built
+    return prev is not None and built is not None and built != prev
 
 
 def main() -> None:

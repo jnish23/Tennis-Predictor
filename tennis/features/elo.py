@@ -8,7 +8,10 @@ K decays with a player's match count so established players move slowly while
 newcomers converge quickly (the shape used by FiveThirtyEight's tennis Elo).
 
 Three tuned behaviours, each measured standalone against 124,899 matches from
-2010 on (`scripts/experiment_elo2.py`):
+2010 on (`scripts/experiment_elo2.py`). That window included the seasons now
+reserved as holdout (2023+), so these constants are in-sample to them; the
+script now selects on 2010-2022 and reports 2023+ apart, and the constants
+should only be re-chosen that way:
 
 **Surface prior.** A surface rating is seeded from the player's *overall*
 rating rather than 1500, then blended toward the surface-specific value as
@@ -96,6 +99,10 @@ class EloBook:
         w = n / (n + SURF_BLEND_N)
         return w * surf + (1.0 - w) * overall
 
+    def players(self) -> list[str]:
+        """Every player with an overall rating."""
+        return [k.split("\x00")[0] for k in self.ratings if k.endswith("\x00overall")]
+
     def n(self, pid: str, scope: str = "overall") -> int:
         return self.counts.get(self._key(pid, scope), 0)
 
@@ -171,3 +178,34 @@ class EloBook:
             book.ratings[k] = float(rating)
             book.counts[k] = int(n)
         return book
+
+
+SEASON_CUT = (12, 25)  # month, day
+
+
+def season_start(date: int) -> int:
+    """First day of the ATP season containing `date`, as YYYYMMDD.
+
+    The tour year does not follow the calendar: the season opens in the last
+    days of December, so the 2026 season begins in 2025.
+
+    The cut is 25 December, and the date is not arbitrary. December holds
+    events at both ends of the tour year -- the Next Gen Finals close a season
+    (18 Dec 2024, 22 Dec 2025) while Doha, Adelaide, Chennai, Brisbane, Pune,
+    Hong Kong and the United Cup open the next one (26-31 Dec). Across all 26
+    seasons in the database, 20-21 and 23-25 December are completely empty:
+    the last season-ending event is the 22nd, the earliest opener the 26th.
+    A cut of 25 December therefore separates them with room on both sides,
+    where 1 December -- tried first -- swept the Next Gen Finals into the
+    season it actually closes.
+    """
+    y, m, d = date // 10000, (date // 100) % 100, date % 100
+    m0, d0 = SEASON_CUT
+    if (m, d) >= (m0, d0):
+        return y * 10000 + m0 * 100 + d0
+    return (y - 1) * 10000 + m0 * 100 + d0
+
+
+def season_label(start: int) -> int:
+    """The season a start date belongs to -- December 2025 opens season 2026."""
+    return start // 10000 + 1

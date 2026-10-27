@@ -33,7 +33,7 @@ better than a coin flip. The fix needs no re-parse: the ladder's own direction
 reveals whose frame the line is in, since P(k1 covers) must fall as the line
 rises. That alone lifted the correlation from +0.09 to +0.43.
 
-*k1 is the winner* (99.8% of resolved matches), so evaluating in k1's frame
+*k1 is the winner* (99.6% of resolved matches, not all), so evaluating in k1's frame
 makes the outcome trivially biased -- actual cover rate 0.82 against a market
 mean of 0.50. Moving into the backtest's own p1, which is chosen by hashing the
 match id and is therefore independent of the result, removes it: market 0.500,
@@ -58,7 +58,7 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from scipy.stats import spearmanr  # noqa: E402
 
 from tennis.db.schema import connect  # noqa: E402
-from tennis.models.common import log_loss  # noqa: E402
+from tennis.models.common import log_loss, season_of  # noqa: E402
 from tennis.models.devig import shin  # noqa: E402
 from tennis.models.evaluate import load_backtest  # noqa: E402
 
@@ -176,11 +176,11 @@ def main() -> None:
     bt = load_backtest()[["match_id", "tourney_date", "is_challenger", "y_win",
                           "pred_total", "y_total", "pred_spread", "y_spread"]]
     tm = pd.read_sql("SELECT te_id, match_id, p1_is_winner FROM te_matches "
-                     "WHERE match_id IS NOT NULL", con)
+                     "WHERE match_id IS NOT NULL AND p1_is_winner IS NOT NULL", con)
     mb = pd.read_sql("SELECT match_id, best_of, totals_usable FROM matches", con)
     base = bt.merge(tm, on="match_id").merge(mb, on="match_id")
     base = base[base.totals_usable == 1]
-    base["season"] = base.tourney_date // 10000
+    base["season"] = season_of(base.tourney_date.to_numpy())
     # Whose p1? The backtest picks p1 by hashing match_id; tennisexplorer has
     # its own ordering. A handicap is quoted from *their* p1, while y_spread is
     # margin relative to *ours*, so every handicap row must be re-oriented or
@@ -212,7 +212,7 @@ def main() -> None:
             # `line` now sits in k1's frame, and k1 is the winner. Move both the
             # line and the price into our p1's frame; our p1 is hash-chosen, so
             # the resulting sample is independent of the result.
-            ours = d.y_win.to_numpy() == 1
+            ours = d.same_side.to_numpy()
             line_ours = np.where(ours, d.line.to_numpy(), -d.line.to_numpy())
             p_mkt = np.where(ours, d.p_mkt.to_numpy(), 1.0 - d.p_mkt.to_numpy())
             # p1 covers by exceeding the line. Confirmed against the corrected

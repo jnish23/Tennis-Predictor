@@ -1,3 +1,6 @@
 alias_id,canonical_id,note
 # Add reviewed ATP duplicates here, e.g.:
 # W730,W0BH,Coleman Wong (3-match stub id)
+104437,V385,Dekel Valtzer (1-match stub inside the same 2006-08 career; same name+country)
+118675,L404,Seung-Hoon Lee (3-match stub 2000-01 overlapping the same career; same name+country)
+# NOT merged: T133 / T0I3 Miguel Tobon. Same name+country, but aged 32 in 2001 and 19 in 2024 -- two people.
