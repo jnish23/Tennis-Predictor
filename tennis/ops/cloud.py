@@ -68,13 +68,15 @@ def prefetch_draws(report: dict) -> None:
 
     The hosted dashboard serves these from the bundle and never calls the
     provider, so this is the only place quota is spent. Skipped without a key.
+    Challenger and ITF events are left out (see `draws_api.prefetchable`); the
+    public site lists only events it holds a draw for.
     """
     if not os.getenv("RAPIDAPI_KEY"):
         report["draws"] = "skipped: no RAPIDAPI_KEY"
         return
     from tennis.ingest import draws_api as d
 
-    got = {}
+    got, skipped = {}, {}
     year = date.today().year
     for tour in TOURS:
         try:
@@ -82,6 +84,9 @@ def prefetch_draws(report: dict) -> None:
         except d.DrawFeedError as exc:
             got[tour] = f"error: {exc}"
             continue
+        found = len(events)
+        events = d.prefetchable(events, tour)
+        skipped[tour] = found - len(events)
         n = 0
         for tid in (events["tournament_id"].tolist() if len(events) else []):
             try:
@@ -93,6 +98,8 @@ def prefetch_draws(report: dict) -> None:
                 break                      # budget or auth; no point continuing
         got[tour] = n
     report["draws"] = got
+    report["draws_skipped_challenger_itf"] = skipped
+    report["rapidapi_remaining"] = d.quota_remaining()
 
 
 def run(kind: str = "daily", *, offline: bool = False, out: Path | None = None) -> dict:

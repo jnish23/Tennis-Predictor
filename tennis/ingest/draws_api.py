@@ -143,6 +143,34 @@ def _refund(n: int = 1) -> None:
 # a single call, which is what keeps this inside the 50/day free tier.
 PAGE_SIZE = 300
 
+# The provider reports what is left of the plan's quota on every response. The
+# counter above is per machine and starts at zero on each fresh CI runner, so
+# it cannot see calls made by earlier runs; this can. None until a response
+# has carried the header, in which case the guard stays out of the way.
+QUOTA_RESERVE = int(os.getenv("RAPIDAPI_QUOTA_RESERVE", "3"))
+_remaining: int | None = None
+_logged_limit_headers = False
+
+
+def quota_remaining() -> int | None:
+    """Calls the provider says are left, as of the last response (None: unknown)."""
+    return _remaining
+
+
+def _note_quota(headers) -> None:
+    global _remaining, _logged_limit_headers
+    limits = {k: v for k, v in headers.items() if "ratelimit" in k.lower()}
+    if limits and not _logged_limit_headers:
+        # Logged once so the first run shows which headers this plan really sends.
+        log.info("rate-limit headers: %s", limits)
+        _logged_limit_headers = True
+    for k, v in limits.items():
+        if k.lower() == "x-ratelimit-requests-remaining":
+            try:
+                _remaining = int(v)
+            except ValueError:
+                pass
+
 
 def cache_only() -> bool:
     """Serve from the shipped cache and never call the provider.
@@ -165,6 +193,7 @@ def _get(path: str, params: dict | None = None, *, cache_as: str | None = None,
     files to fall back on (the newest wins) when the exact key was never
     fetched -- a date-keyed request made a day after the job ran.
     """
+    global _remaining
     cf = CACHE / f"{cache_as}.json" if cache_as else None
     if cache_only():
         if cf and cf.exists():
@@ -180,6 +209,10 @@ def _get(path: str, params: dict | None = None, *, cache_as: str | None = None,
         return json.loads(cf.read_text())
 
     key = _key()                 # fail on a missing key before spending anything
+    if _remaining is not None and _remaining <= QUOTA_RESERVE:
+        raise DrawFeedError(
+            f"provider reports {_remaining} call(s) left; stopping at a reserve "
+            f"of {QUOTA_RESERVE}")
     _spend()
     try:
         r = requests.get(
@@ -189,7 +222,9 @@ def _get(path: str, params: dict | None = None, *, cache_as: str | None = None,
     except requests.RequestException as exc:
         _refund()                # never reached the provider: not quota used
         raise DrawFeedError(f"request failed: {exc}") from exc
+    _note_quota(r.headers)
     if r.status_code == 429:
+        _remaining = 0
         raise DrawFeedError("rate limited / quota exceeded by the provider (429)")
     if r.status_code == 403:
         raise DrawFeedError(
@@ -761,6 +796,32 @@ RANK_LEVEL: dict[int, str] = {
     1: "challenger", 2: "atp250", 3: "masters", 7: "finals",
 }
 RANK_ITF = 0
+RANK_CHALLENGER = 1
+_ITF_NAME = re.compile(r"^[MW]\d+\b")        # "M15 Arad", "W35 Birmingham"
+
+
+def prefetchable(events: pd.DataFrame, tour: str) -> pd.DataFrame:
+    """Events worth spending quota on: the main tours, not Challenger or ITF.
+
+    Each event costs two calls (draw sheet and fixtures) and a busy week lists
+    around twenty ATP events, most of them Challengers, which on its own ate
+    most of a 50-call day. `rankId` separates them for the ATP feed (0 ITF,
+    1 Challenger). It cannot for the WTA feed, where 1 mixes WTA tour events
+    with ITF W35s, so there only ITF is dropped, by rank and by name.
+    """
+    if events.empty:
+        return events
+    rank = events["rank_id"]
+    drop = (rank == RANK_ITF) | events["name"].fillna("").str.match(_ITF_NAME)
+    if tour == "atp":
+        drop |= rank == RANK_CHALLENGER
+    return events[~drop].reset_index(drop=True)
+
+
+def has_cached_draw(tournament_id, tour: str = "atp") -> bool:
+    """Whether a draw sheet or fixtures list for this event is on disk."""
+    return (any(CACHE.glob(f"draws_{tour}_{tournament_id}_*.json"))
+            or (CACHE / f"fixtures_{tour}_{tournament_id}.json").exists())
 
 
 def context_hints(fx: pd.DataFrame) -> dict:

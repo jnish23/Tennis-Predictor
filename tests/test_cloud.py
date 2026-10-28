@@ -273,3 +273,80 @@ print(json.dumps(cloud.odds(out=Path({str(tmp_path / 'out')!r}), capture_fn=fake
     assert out["restored"] == 1 and out["total"] == 2
     assert len(pd.read_parquet(tmp_path / "out" / bundle.SNAPSHOTS_FILE)) == 2
     assert (data / "tennis.db").exists()
+
+
+def test_prefetch_skips_challenger_and_itf_but_keeps_wta_tour_events():
+    import pandas as pd
+    from tennis.ingest import draws_api as d
+
+    ev = pd.DataFrame({
+        "tournament_id": [1, 2, 3, 4, 5, 6],
+        "name": ["Paris Masters", "Brest Challenger", "M15 Arad", "U.S. Open - New York",
+                 "Lisboa Belem Open - Lisbon", "W35 Birmingham"],
+        "rank_id": [3, 1, 0, 4, 1, 1],
+    })
+    assert d.prefetchable(ev, "atp")["tournament_id"].tolist() == [1, 4]
+    # WTA's rank 1 mixes tour events with ITF W35s, so only ITF is dropped.
+    assert d.prefetchable(ev, "wta")["tournament_id"].tolist() == [1, 2, 4, 5]
+    assert d.prefetchable(ev.iloc[0:0], "atp").empty
+
+
+def test_quota_header_stops_calls_before_the_provider_refuses(tmp_path, monkeypatch):
+    from tennis.ingest import draws_api as d
+
+    monkeypatch.setattr(d, "CACHE", tmp_path)
+    monkeypatch.setattr(d, "_BUDGET_FILE", tmp_path / "_usage.json")
+    monkeypatch.setattr(d, "_remaining", None)
+    monkeypatch.setattr(d, "_logged_limit_headers", False)
+    monkeypatch.setattr(d, "QUOTA_RESERVE", 3)
+    monkeypatch.delenv("DATA_BUNDLE_URL", raising=False)
+    monkeypatch.delenv("TENNIS_DRAWS_CACHE_ONLY", raising=False)
+    monkeypatch.setenv("RAPIDAPI_KEY", "k")
+    calls = []
+
+    class Resp:
+        status_code = 200
+        url = "http://x"
+        text = ""
+        def __init__(self, left): self.headers = {"X-RateLimit-Requests-Remaining": str(left)}
+        def json(self): return {"ok": 1}
+
+    left = iter([4, 3])
+    monkeypatch.setattr(d.requests, "get", lambda *a, **k: calls.append(1) or Resp(next(left)))
+    assert d._get("/a") == {"ok": 1}
+    assert d.quota_remaining() == 4
+    assert d._get("/b") == {"ok": 1}            # 4 left: still above the reserve
+    assert d.quota_remaining() == 3
+    with pytest.raises(d.DrawFeedError, match="reserve"):
+        d._get("/c")                             # 3 left: at the reserve, no call
+    assert len(calls) == 2
+
+
+def test_quota_guard_is_inert_when_the_provider_sends_no_header(tmp_path, monkeypatch):
+    from tennis.ingest import draws_api as d
+
+    monkeypatch.setattr(d, "CACHE", tmp_path)
+    monkeypatch.setattr(d, "_BUDGET_FILE", tmp_path / "_usage.json")
+    monkeypatch.setattr(d, "_remaining", None)
+    monkeypatch.delenv("DATA_BUNDLE_URL", raising=False)
+    monkeypatch.delenv("TENNIS_DRAWS_CACHE_ONLY", raising=False)
+    monkeypatch.setenv("RAPIDAPI_KEY", "k")
+
+    class Resp:
+        status_code, url, text, headers = 200, "http://x", "", {}
+        def json(self): return {"ok": 1}
+
+    monkeypatch.setattr(d.requests, "get", lambda *a, **k: Resp())
+    assert d._get("/a") == {"ok": 1}
+    assert d.quota_remaining() is None
+
+
+def test_has_cached_draw_sees_either_file(tmp_path, monkeypatch):
+    from tennis.ingest import draws_api as d
+
+    monkeypatch.setattr(d, "CACHE", tmp_path)
+    assert not d.has_cached_draw(7, "atp")
+    (tmp_path / "fixtures_atp_7.json").write_text("{}")
+    assert d.has_cached_draw(7, "atp") and not d.has_cached_draw(7, "wta")
+    (tmp_path / "draws_wta_8_2026.json").write_text("{}")
+    assert d.has_cached_draw(8, "wta")

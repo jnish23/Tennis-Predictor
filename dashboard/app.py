@@ -1492,6 +1492,16 @@ def _mode_live(n_sims: int) -> None:
         help="M15/M25 futures are below Challenger level and are largely absent "
              "from our player database.")
     listed = live if show_itf else atp
+    if cache_only():
+        # The daily job prefetches main-tour draws only; a Challenger here would
+        # fail with "no cached draw data" the moment it was picked.
+        from tennis.ingest.draws_api import has_cached_draw
+        held = listed[[has_cached_draw(i, current_tour()) for i in listed["tournament_id"]]]
+        if len(listed) > len(held):
+            st.caption(
+                f"{len(listed) - len(held)} event(s) hidden: this site only holds "
+                "draws for main-tour events (no Challenger or ITF).")
+        listed = held
     if listed.empty:
         st.warning("No ATP-level tournaments scheduled in that window.")
         return
