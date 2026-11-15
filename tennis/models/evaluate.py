@@ -161,16 +161,16 @@ def voided(df: pd.DataFrame, book: str | None = None) -> np.ndarray:
 # --------------------------------------------------------------------------
 # ROI
 # --------------------------------------------------------------------------
-def roi_winner(df: pd.DataFrame, edge: float = 0.03, stake: float = 1.0,
-               kelly: bool = False, cap: float = 0.05) -> dict:
-    """Flat (or fractional-Kelly) staking on whichever side shows an edge.
+def winner_bets(df: pd.DataFrame, edge: float) -> tuple[pd.DataFrame, int]:
+    """The moneyline bets taken at this edge, one row each, plus the void count.
 
-    Bets the book would void (see `voided`) are not bets: they return the stake
-    and count in `voided_matches`. The ROI interval resamples whole tournaments.
+    Shared by `roi_winner` and the per-tournament breakdown so both always agree
+    on what was bet. Bets the book would void (see `voided`) are not bets: they
+    are dropped here and counted in the second return value.
     """
     d = df.dropna(subset=["p1_price", "p2_price", "p_win"]).copy()
     if d.empty:
-        return {"bets": 0}
+        return d, 0
 
     # Edge on each side against that side's actual price.
     d["ev1"] = d["p_win"] * d["p1_price"] - 1
@@ -180,13 +180,27 @@ def roi_winner(df: pd.DataFrame, edge: float = 0.03, stake: float = 1.0,
     d = d[d["ev"] > edge]
     void = voided(d)
     n_void_pool = int(void.sum())
-    d = d[~void]
+    d = d[~void].copy()
+    d["price"] = np.where(d["side"] == 1, d["p1_price"], d["p2_price"])
+    d["p"] = np.where(d["side"] == 1, d["p_win"], 1 - d["p_win"])
+    d["won"] = np.where(d["side"] == 1, d["y_win"] == 1, d["y_win"] == 0)
+    return d, n_void_pool
+
+
+def roi_winner(df: pd.DataFrame, edge: float = 0.03, stake: float = 1.0,
+               kelly: bool = False, cap: float = 0.05) -> dict:
+    """Flat (or fractional-Kelly) staking on whichever side shows an edge.
+
+    Bets the book would void (see `voided`) are not bets: they return the stake
+    and count in `voided_matches`. The ROI interval resamples whole tournaments.
+    """
+    if df.dropna(subset=["p1_price", "p2_price", "p_win"]).empty:
+        return {"bets": 0}
+    d, n_void_pool = winner_bets(df, edge)
     if d.empty:
         return {"bets": 0, "voided_matches": n_void_pool}
 
-    price = np.where(d["side"] == 1, d["p1_price"], d["p2_price"])
-    p = np.where(d["side"] == 1, d["p_win"], 1 - d["p_win"])
-    won = np.where(d["side"] == 1, d["y_win"] == 1, d["y_win"] == 0)
+    price, p, won = d["price"].to_numpy(), d["p"].to_numpy(), d["won"].to_numpy()
 
     if kelly:
         b = price - 1
@@ -256,6 +270,40 @@ def _reference_line(df: pd.DataFrame, col: str) -> pd.Series:
     return pd.Series(out["line"].to_numpy(), index=df.index)
 
 
+def synthetic_bets(df: pd.DataFrame, y_col: str, pred_col: str, edge: float,
+                   price: float = VIG_PRICE) -> tuple[pd.DataFrame | None, dict]:
+    """Over/under bets against the naive reference line, one row each.
+
+    Returns (None, {}) when no line can be built at all, and an empty frame
+    (with `baseline`) when the line exists but nothing clears the edge. Shared
+    by `roi_synthetic` and the per-tournament breakdown.
+    """
+    d = df.dropna(subset=[y_col, pred_col]).copy()
+    if d.empty:
+        return None, {}
+    d["line"] = _reference_line(d, y_col)
+    d = d.dropna(subset=["line"])
+    if d.empty:
+        return None, {}
+    base_mae = float(np.abs(d["line"] - d[y_col]).mean())
+    model_mae = float(np.abs(d[pred_col] - d[y_col]).mean())
+    baseline = {
+        "reference_line_mae": round(base_mae, 3),
+        "model_mae": round(model_mae, 3),
+        "reference_line_std": round(float(d["line"].std()), 3),
+        "actual_std": round(float(d[y_col].std()), 3),
+    }
+    d["diff"] = d[pred_col] - d["line"]
+    d = d[d["diff"].abs() > edge].copy()
+    over = d["diff"] > 0
+    # Push when the outcome lands exactly on the line: stake returned.
+    d["over"] = over
+    d["push"] = d[y_col] == d["line"]
+    d["won"] = np.where(over, d[y_col] > d["line"], d[y_col] < d["line"])
+    d["profit"] = np.where(d["push"], 0.0, np.where(d["won"], price - 1, -1.0))
+    return d, baseline
+
+
 def roi_synthetic(df: pd.DataFrame, y_col: str, pred_col: str,
                   edge: float, price: float = VIG_PRICE) -> dict:
     """Bet the model against a naive reference line at -110. Synthetic, not market.
@@ -267,31 +315,12 @@ def roi_synthetic(df: pd.DataFrame, y_col: str, pred_col: str,
     anything a real totals market would concede. It demonstrates the model has
     signal; it does NOT estimate profitability.
     """
-    d = df.dropna(subset=[y_col, pred_col]).copy()
-    if d.empty:
+    d, baseline = synthetic_bets(df, y_col, pred_col, edge, price)
+    if d is None:
         return {"bets": 0, "synthetic": True}
-    d["line"] = _reference_line(d, y_col)
-    d = d.dropna(subset=["line"])
-    if d.empty:
-        return {"bets": 0, "synthetic": True}
-    base_mae = float(np.abs(d["line"] - d[y_col]).mean())
-    model_mae = float(np.abs(d[pred_col] - d[y_col]).mean())
-    baseline = {
-        "reference_line_mae": round(base_mae, 3),
-        "model_mae": round(model_mae, 3),
-        "reference_line_std": round(float(d["line"].std()), 3),
-        "actual_std": round(float(d[y_col].std()), 3),
-    }
-    d["diff"] = d[pred_col] - d["line"]
-    d = d[d["diff"].abs() > edge]
     if d.empty:
         return {"bets": 0, "synthetic": True, "baseline": baseline}
-
-    over = d["diff"] > 0
-    # Push when the outcome lands exactly on the line: stake returned.
-    push = d[y_col] == d["line"]
-    won = np.where(over, d[y_col] > d["line"], d[y_col] < d["line"])
-    profit = np.where(push, 0.0, np.where(won, price - 1, -1.0))
+    push, won, profit = d["push"].to_numpy(), d["won"].to_numpy(), d["profit"].to_numpy()
     return {
         "bets": int(len(d)),
         "turnover": int(len(d)),
@@ -308,6 +337,157 @@ def roi_synthetic(df: pd.DataFrame, y_col: str, pred_col: str,
             "ROI is inflated by the line's weakness, not by market edge."
         ),
     }
+
+
+# --------------------------------------------------------------------------
+# per-tournament record
+# --------------------------------------------------------------------------
+# Thresholds for the per-tournament view. Moneyline uses the same 3% edge as the
+# headline ROI table; totals and spread use the middle of the synthetic edges.
+TOURNAMENT_EDGE = {"winner": 0.03, "totals": 2.0, "spread": 2.0}
+# Bet-level detail is kept for the most recent events only, to keep the report
+# small; every older event still gets its summary row.
+TOURNAMENT_DETAIL = 60
+
+
+def _tally(d: pd.DataFrame, push: bool = False) -> dict:
+    """W-L-P and flat 1u profit for one tournament's bets of one type."""
+    if d is None or d.empty:
+        return {"bets": 0, "won": 0, "push": 0, "profit": 0.0}
+    n_push = int(d["push"].sum()) if push else 0
+    return {"bets": int(len(d)), "won": int(d["won"].sum()), "push": n_push,
+            "profit": round(float(d["profit"].sum()), 2)}
+
+
+def tournament_results(bt: pd.DataFrame, withodds: pd.DataFrame, tour: str,
+                       since: int = HOLDOUT_FROM * 10000) -> dict:
+    """Record and flat-stake profit per main-tour event, for each bet type.
+
+    Winner bets are real: Pinnacle closing prices, the same bets the headline
+    ROI counts. Totals and spread are the synthetic-line test (see
+    `roi_synthetic`) -- there is no market to price them against -- and are
+    reported as such. Reported per event, a handful of bets each, so a single
+    event's ROI is mostly noise; the cumulative picture is the one to trust.
+    """
+    con = connect()
+    try:
+        meta = pd.read_sql(
+            "SELECT tourney_key, name, level, surface, tourney_date, draw_size "
+            "FROM tournaments WHERE tour = ?", con, params=(tour,))
+        names = pd.read_sql("SELECT player_id, name FROM players WHERE tour = ?",
+                            con, params=(tour,)).set_index("player_id")["name"]
+    finally:
+        con.close()
+    meta = meta.set_index("tourney_key")
+
+    bt = bt.copy()
+    bt["tkey"] = tourney_key_of(bt["match_id"]).to_numpy()
+    bt["round"] = bt["match_id"].str.rsplit("-", n=3).str[1]
+    # Davis Cup ties are stored one per "tournament": a handful of matches
+    # each, between national squads, which is not what this view is about.
+    def _in_scope(df):
+        return ((df["tourney_date"] >= since) & (df["is_challenger"] == 0)
+                & (df["tkey"].map(meta["level"]) != "davis_cup"))
+
+    in_scope = _in_scope(bt)
+
+    # Moneyline picks (the favoured side, every match) and bets (edge only).
+    scope = bt[in_scope]
+    picks = (scope.assign(ok=((scope["p_win"] >= 0.5) == (scope["y_win"] == 1)))
+                  .groupby("tkey")["ok"].agg(correct="sum", n="size"))
+
+    # Pinnacle's close where we hold it. The historical feed stops at
+    # PS_LAST_SEEN, so later events fall back to our own last pre-match capture
+    # (book TE_CLOSE): a retail-margin price, not a sharp one, and flagged per
+    # event as such. Each pool is settled under its own book's retirement rule.
+    def _prep(df):
+        df = df.copy()
+        df["tkey"] = tourney_key_of(df["match_id"]).to_numpy()
+        df["round"] = df["match_id"].str.rsplit("-", n=3).str[1]
+        return df[_in_scope(df)]
+
+    ps = _prep(withodds).dropna(subset=["p1_price", "p2_price"]).assign(src="PS")
+    te = _prep(attach_odds(bt[bt["tourney_date"] >= since], book="TE_CLOSE"))
+    te = te.dropna(subset=["p1_price", "p2_price"])
+    te = te[~te["match_id"].isin(ps["match_id"])].assign(src="TE")
+    pools = [w for w, _ in (winner_bets(x, TOURNAMENT_EDGE["winner"])
+                            for x in (ps, te) if len(x)) if not w.empty]
+    wb = pd.concat(pools) if pools else pd.DataFrame()
+    if not wb.empty:
+        wb["profit"] = np.where(wb["won"], wb["price"] - 1, -1.0)
+        wb["push"] = False
+    # Which price source each event's matches were priced from.
+    priced_src = (pd.concat([ps[["tkey", "src"]], te[["tkey", "src"]]])
+                  .groupby("tkey")["src"].agg(lambda x: "+".join(sorted(set(x)))))
+
+    # Reference lines are built from the full backtest, then narrowed to scope.
+    def _syn(y_col, pred_col, edge):
+        d, _ = synthetic_bets(bt, y_col, pred_col, edge)
+        if d is None:
+            return pd.DataFrame(columns=bt.columns)
+        return d[_in_scope(d)]
+    tb = _syn("y_total", "pred_total", TOURNAMENT_EDGE["totals"])
+    sb = _syn("y_spread", "pred_spread", TOURNAMENT_EDGE["spread"])
+
+    def _name(i):
+        return str(names.get(i, i))
+
+    def _rows(d, kind):
+        out: dict[str, list] = {}
+        for r in d.itertuples():
+            a, b = _name(r.p1_id), _name(r.p2_id)
+            if kind == "winner":
+                pick, vs = (a, b) if r.side == 1 else (b, a)
+                row = {"t": "winner", "r": r.round, "pick": pick, "vs": vs,
+                       "line": round(float(r.price), 2), "model": round(float(r.p), 3),
+                       "actual": None}
+            elif kind == "totals":
+                row = {"t": "totals", "r": r.round, "pick": "Over" if r.over else "Under",
+                       "vs": f"{a} v {b}", "line": round(float(r.line), 1),
+                       "model": round(float(r.pred_total), 1),
+                       "actual": int(r.y_total)}
+            else:
+                sign = 1 if r.over else -1
+                row = {"t": "spread", "r": r.round, "pick": a if r.over else b,
+                       "vs": b if r.over else a,
+                       "line": round(-sign * float(r.line), 1),
+                       "model": round(sign * float(r.pred_spread), 1),
+                       "actual": int(sign * r.y_spread)}
+            row.update(won=int(r.won), push=int(r.push), profit=round(float(r.profit), 2))
+            out.setdefault(r.tkey, []).append(row)
+        return out
+
+    keys = sorted(scope["tkey"].unique(),
+                  key=lambda k: (meta["tourney_date"].get(k, 0), k))
+    recent = set(keys[-TOURNAMENT_DETAIL:])
+    detail = {}
+    for kind, d in (("winner", wb), ("totals", tb), ("spread", sb)):
+        if len(d):
+            for k, v in _rows(d[d["tkey"].isin(recent)], kind).items():
+                detail.setdefault(k, []).extend(v)
+
+    rows = []
+    for k in keys:
+        m = meta.loc[k] if k in meta.index else None
+        pk = picks.loc[k]
+        rows.append({
+            "key": k,
+            "name": m["name"] if m is not None and m["name"] else k.split("|")[1].title(),
+            "level": None if m is None else m["level"],
+            "surface": None if m is None else m["surface"],
+            "date": int(m["tourney_date"]) if m is not None else None,
+            "draw_size": None if m is None or pd.isna(m["draw_size"]) else int(m["draw_size"]),
+            "picks": {"n": int(pk["n"]), "correct": int(pk["correct"])},
+            "winner": _tally(wb[wb["tkey"] == k] if len(wb) else None),
+            "price_src": priced_src.get(k),
+            "totals": _tally(tb[tb["tkey"] == k], push=True),
+            "spread": _tally(sb[sb["tkey"] == k], push=True),
+            "bets": detail.get(k, []),
+        })
+    return {"since": since, "edges": TOURNAMENT_EDGE,
+            "priced": bool(len(ps) or len(te)),
+            "ps_last_seen": int(ps["tourney_date"].max()) if len(ps) else None,
+            "tournaments": rows}
 
 
 # --------------------------------------------------------------------------
@@ -498,6 +678,8 @@ def full_report(book: str = "PS", tour: str = "atp") -> dict:
             con.close()
     except Exception as exc:
         log.warning("market-line comparison skipped: %s", exc)
+
+    rep["by_tournament"] = tournament_results(bt, withodds, tour)
 
     _carry_market_lines(rep, tour)
     rep["generated_at"] = pd.Timestamp.now("UTC").isoformat(timespec="seconds")

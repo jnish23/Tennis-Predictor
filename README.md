@@ -747,9 +747,12 @@ model fit on 200k rows.
 
 ## Dashboard
 
-Six pages: match predictions (all three targets), tournament simulation over a
-live or replayed draw, backtest performance over time with breakouts,
-calibration plots, Elo ratings, and pipeline status.
+Five pages: tournament simulation (the landing page; it opens on this week's
+biggest event, ranked by tier and then by how strong its field usually is, and
+any other live event or a replayed past draw can be picked), betting (upcoming
+bets, plus a per-tournament win/loss and ROI record for winner, totals and
+spread), match predictions, backtest performance with breakouts, and Elo
+ratings. The sidebar warns when the nightly data job has not run for 36 hours.
 
 The ratings page offers **All-time** and **Season to date**. Season to date
 shows how far the career rating has moved since the season opened.
