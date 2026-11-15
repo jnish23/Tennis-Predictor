@@ -679,7 +679,11 @@ def full_report(book: str = "PS", tour: str = "atp") -> dict:
     except Exception as exc:
         log.warning("market-line comparison skipped: %s", exc)
 
-    rep["by_tournament"] = tournament_results(bt, withodds, tour)
+    # Display-only: a failure here must not cost the rest of the report.
+    try:
+        rep["by_tournament"] = tournament_results(bt, withodds, tour)
+    except Exception as exc:
+        log.warning("per-tournament record skipped: %s", exc)
 
     _carry_market_lines(rep, tour)
     rep["generated_at"] = pd.Timestamp.now("UTC").isoformat(timespec="seconds")
