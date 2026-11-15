@@ -1,7 +1,7 @@
 """Streamlit dashboard for the ATP prediction system.
 
-Pages: match predictions (all three targets), backtest performance over time,
-calibration, tournament bracket simulation, and current Elo ratings.
+Pages: tournament bracket simulation (the landing page), betting, match
+predictions (all three targets), backtest performance, and current Elo ratings.
 
 Run:  streamlit run dashboard/app.py
 """
@@ -23,7 +23,6 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 from tennis.config import ARTIFACTS  # noqa: E402
 from tennis.db.schema import connect  # noqa: E402
 from tennis.features.elo import season_label  # noqa: E402
-from tennis.models.common import calibration_table  # noqa: E402
 
 st.set_page_config(page_title="Tennis Prediction Model", layout="wide",
                    page_icon="🎾")
@@ -89,6 +88,29 @@ def data_as_of() -> str:
         if meta:
             parts.append(f"built {meta.get('built_at', '')[:16].replace('T', ' ')} UTC")
     return "Data as of: " + " · ".join(parts) if parts else "Data freshness unknown."
+
+
+STALE_AFTER_HOURS = 36
+
+
+def pipeline_stale_warning() -> str | None:
+    """The one thing the retired Status page was for: is the daily job alive?
+
+    The job runs every night, so a last run older than a day and a half means it
+    has failed or stopped and everything on screen is going out of date.
+    """
+    try:
+        run = json.loads((ARTIFACTS / "last_daily_run.json").read_text())
+        ts = pd.Timestamp(run.get("finished") or run["started"])
+    except (FileNotFoundError, ValueError, KeyError):
+        return None
+    if ts.tzinfo is None:
+        ts = ts.tz_localize("UTC")
+    age = (pd.Timestamp.now("UTC") - ts).total_seconds() / 3600
+    if age > STALE_AFTER_HOURS:
+        return (f"The daily data job last ran {age / 24:.1f} days ago. "
+                "Ratings, odds and draws below may be out of date.")
+    return None
 
 
 refresh_hosted_data()
@@ -757,36 +779,6 @@ def _roi_by_season(rep: dict) -> None:
     )
 
 
-def page_calibration() -> None:
-    st.header("Calibration")
-    bt = load_backtest(current_tour())
-    if bt is None:
-        st.warning("No backtest found.")
-        return
-    seasons = sorted(bt["season"].unique())
-    sel = st.multiselect("Seasons", seasons, default=seasons)
-    sub = bt[bt["season"].isin(sel)] if sel else bt
-    if sub.empty:
-        st.info("No matches selected.")
-        return
-
-    y, p = sub["y_win"].to_numpy(), sub["p_win"].to_numpy()
-    tbl = calibration_table(y, p, bins=10)
-    fig = go.Figure()
-    fig.add_trace(go.Scatter(x=[0, 1], y=[0, 1], mode="lines",
-                             line=dict(dash="dash", color="grey"), name="Perfect"))
-    fig.add_trace(go.Scatter(x=tbl["pred_mean"], y=tbl["actual"], mode="markers+lines",
-                             marker=dict(size=8), name="Model",
-                             text=tbl["n"], hovertemplate="pred %{x:.3f}<br>actual %{y:.3f}<br>n=%{text}"))
-    fig.update_layout(xaxis_title="Predicted probability", yaxis_title="Observed win rate",
-                      height=520, xaxis=dict(range=[0, 1]), yaxis=dict(range=[0, 1]))
-    st.plotly_chart(fig, width="stretch")
-    st.dataframe(tbl, width="stretch", hide_index=True)
-
-    st.subheader("Prediction distribution")
-    st.plotly_chart(px.histogram(sub, x="p_win", nbins=20), width="stretch")
-
-
 BRACKET_CSS = """<style>
 .bkt {display:flex; gap:22px; overflow-x:auto; padding:6px 2px 14px;
       --bline:#4a4a4a; --qline:#4d4d4d; --hline:#7a7a7a; --tgap:6px;}
@@ -1356,6 +1348,54 @@ def _live_tournaments(days: int, tour: str = "atp") -> pd.DataFrame:
     return discover_tournaments(days=days, tour=tour)
 
 
+@st.cache_data(ttl=CACHE_TTL, show_spinner=False)
+def _field_strength(tour: str = "atp") -> pd.Series:
+    """How strong each event's field usually is: mean rank of its best eight.
+
+    Used only to break ties between events of the same tier running the same
+    week (two ATP 500s, say), where the feed has nothing to separate them. It
+    is deliberately a measure of the *event's* usual draw, from the last three
+    seasons of our own results, rather than of this week's field -- the field
+    is only knowable once the draw is out, and the feed does not publish that
+    in time to pick the page's default. Lower is stronger; keyed by lower-cased
+    city, the same key `_refine_from_history` matches on.
+    """
+    con = connect()
+    try:
+        m = pd.read_sql(
+            "SELECT t.name, t.tourney_key, m.winner_id, m.winner_rank, "
+            "m.loser_id, m.loser_rank FROM matches m "
+            "JOIN tournaments t ON t.tourney_key = m.tourney_key "
+            "WHERE t.tour = ? AND t.is_challenger = 0 AND t.season >= "
+            "(SELECT MAX(season) - 2 FROM tournaments WHERE tour = ?)",
+            con, params=(tour, tour))
+    finally:
+        con.close()
+    if m.empty:
+        return pd.Series(dtype=float)
+    long = pd.concat([
+        m[["name", "tourney_key", "winner_id", "winner_rank"]]
+        .set_axis(["name", "tourney_key", "pid", "rank"], axis=1),
+        m[["name", "tourney_key", "loser_id", "loser_rank"]]
+        .set_axis(["name", "tourney_key", "pid", "rank"], axis=1),
+    ]).dropna(subset=["rank"])
+    best = (long.groupby(["name", "tourney_key", "pid"])["rank"].min()
+                .reset_index().sort_values("rank")
+                .groupby(["name", "tourney_key"]).head(8))
+    per_event = best.groupby(["name", "tourney_key"])["rank"].mean()
+    out = per_event.groupby("name").mean()
+    out.index = out.index.str.lower()
+    return out
+
+
+def _feed_city(feed_name: str) -> str:
+    """The bare city in a feed name such as "Erste Bank Open - Vienna"."""
+    tail = str(feed_name).split(" - ")[-1]
+    for junk in (" Challenger", " Open", " 2", " 1"):
+        tail = tail.replace(junk, "")
+    return tail.strip().lower()
+
+
 # Which tier a level belongs to. History is only ever consulted to resolve an
 # ambiguity *inside* a tier, never to move an event between them.
 LEVEL_BAND = {
@@ -1443,16 +1483,16 @@ def _refine_from_history(feed_name: str, band: str | None = None) -> dict:
 def _mode_live(n_sims: int) -> None:
     import os
 
-    st.caption(
-        "Upcoming draws come from the RapidAPI fixtures feed. Past draws never "
-        "use it \u2014 those are reconstructed locally."
-    )
-    st.info(
-        "**What this feed can do:** once an opening round is scheduled \u2014 in "
-        "practice about a day before play \u2014 the full first round is available. "
-        "It does **not** publish draws at ceremony time: an event eight weeks out "
-        "returns nothing. Simulate the evening before, not a week ahead."
-    )
+    with st.expander("How live draws work"):
+        st.markdown(
+            "Upcoming draws come from the RapidAPI fixtures feed. Past draws "
+            "never use it \u2014 those are reconstructed locally.\n\n"
+            "**What this feed can do:** once an opening round is scheduled "
+            "\u2014 in practice about a day before play \u2014 the full first round "
+            "is available. It does **not** publish draws at ceremony time: an "
+            "event eight weeks out returns nothing. Simulate the evening before, "
+            "not a week ahead."
+        )
     from tennis.ingest.draws_api import cache_only
     if cache_only():
         st.caption(
@@ -1535,65 +1575,93 @@ def _mode_live(n_sims: int) -> None:
     # Biggest event first. The feed orders by fixture count, which buries a
     # Masters under whichever Challenger happens to have more matches left.
     # Unknown levels sort last rather than jumping the queue.
+    # Within a tier, the event that usually draws the stronger field comes first
+    # (see `_field_strength`); remaining fixtures only settles what is left.
+    strength = _field_strength(current_tour())
     listed = listed.assign(
         _lvl=[LEVEL_RANK.get(ctx_by_id[i].get("level"), 99)
-              for i in listed["tournament_id"]]
-    ).sort_values(["_lvl", "fixtures"], ascending=[True, False]).drop(columns="_lvl")
+              for i in listed["tournament_id"]],
+        _str=[strength.get(_feed_city(n), 9999.0) for n in listed["name"]],
+    ).sort_values(["_lvl", "_str", "fixtures"],
+                  ascending=[True, True, False]).drop(columns=["_lvl", "_str"])
 
     disp = listed.copy()
     disp["surface"] = disp["tournament_id"].map(
         lambda i: ctx_by_id[i].get("surface", "?"))
     disp["level"] = disp["tournament_id"].map(
         lambda i: ctx_by_id[i].get("level", "?"))
-    st.markdown("**Tournaments with scheduled fixtures**")
-    show_table(disp[["name", "fixtures", "surface", "level",
-                     "first_date", "last_date"]].rename(columns={
-        "name": "Tournament", "fixtures": "Fixtures", "surface": "Surface",
-        "level": "Level", "first_date": "From", "last_date": "To"}))
-
     # Select by name; the id travels along but is never what the user reads.
+    # The list is already ordered biggest-first, so the first entry is the one
+    # the page opens on.
     id_by_label = {}
-    for r in listed.itertuples():
-        label = f"{r.name}  \u2014  {r.fixtures} fixtures"
+    for n, r in enumerate(listed.itertuples()):
+        star = "\u2605 " if n == 0 else ""
+        label = f"{star}{r.name}  \u2014  {r.fixtures} fixtures"
         id_by_label[label] = r.tournament_id
-    choice = st.selectbox("Tournament", list(id_by_label))
+    choice = st.selectbox(
+        "Tournament", list(id_by_label),
+        help="The page opens on the biggest event this week (\u2605): highest "
+             "tier first, and between events of the same tier the one that "
+             "usually draws the stronger field.")
     tid = id_by_label[choice]
+    with st.expander("All tournaments with scheduled fixtures"):
+        show_table(disp[["name", "fixtures", "surface", "level",
+                         "first_date", "last_date"]].rename(columns={
+            "name": "Tournament", "fixtures": "Fixtures", "surface": "Surface",
+            "level": "Level", "first_date": "From", "last_date": "To"}))
     row = listed[listed["tournament_id"] == tid].iloc[0]
 
     ctx = ctx_by_id[tid]
     hint_surface, hint_level = ctx.get("surface"), ctx.get("level")
 
-    c1, c2, c3 = st.columns(3)
-    surface = c1.selectbox(
-        "Surface", SURFACES,
-        index=SURFACES.index(hint_surface) if hint_surface in SURFACES else 0,
-        key="live_surf")
-    level = c2.selectbox(
-        "Level", LEVELS,
-        index=LEVELS.index(hint_level) if hint_level in LEVELS else 3,
-        key="live_lvl")
-    best_of = c3.selectbox("Best of", [3, 5], key="live_bo")
-    st.caption(
-        "Surface and level are pre-filled from the feed's court and tier codes, "
-        "refined against our own history for the same city and **the same "
-        "tier** \u2014 the feed cannot tell ATP 250 from ATP 500, which is all the "
-        "lookup is for. It is tier-scoped because a city can host several: "
-        "Hamburg runs an ATP 500, a retired Masters and a Challenger, and an "
-        "unscoped match relabelled the Challenger a 500. Both are editable. "
-        "Best-of is not carried by the feed \u2014 set it yourself (5 only for "
-        "Grand Slams)."
-    )
+    # Keyed by tournament: a fixed key kept the previous event's surface and
+    # level after switching, so the pre-filled hints never applied.
+    bo_default = 1 if (hint_level == "grand_slam" and current_tour() == "atp") else 0
+    with st.expander("Simulation settings", expanded=False):
+        c1, c2, c3 = st.columns(3)
+        surface = c1.selectbox(
+            "Surface", SURFACES,
+            index=SURFACES.index(hint_surface) if hint_surface in SURFACES else 0,
+            key=f"live_surf_{tid}")
+        level = c2.selectbox(
+            "Level", LEVELS,
+            index=LEVELS.index(hint_level) if hint_level in LEVELS else 3,
+            key=f"live_lvl_{tid}")
+        best_of = c3.selectbox("Best of", [3, 5], index=bo_default,
+                               key=f"live_bo_{tid}")
+        st.caption(
+            "Surface and level are pre-filled from the feed's court and tier "
+            "codes, refined against our own history for the same city and **the "
+            "same tier** \u2014 the feed cannot tell ATP 250 from ATP 500, which is "
+            "all the lookup is for. It is tier-scoped because a city can host "
+            "several: Hamburg runs an ATP 500, a retired Masters and a "
+            "Challenger, and an unscoped match relabelled the Challenger a 500. "
+            "Both are editable. Best-of is not carried by the feed \u2014 it "
+            "defaults to 5 for men's Grand Slams and 3 otherwise; change it if "
+            "that is wrong."
+        )
 
-    # The numeric id, not a derived slug. A slug that does not match returns an
-    # empty sheet rather than an error, so a bad guess showed up as a bracket
-    # built from the fixtures fallback -- right pairings, wrong positions --
-    # with nothing on screen to say the real draw had been missed.
-    draw_key = st.text_input(
-        "Draw-sheet key", str(row["tournament_id"]),
-        help="The tournament id the draw endpoint keys on. It also accepts a "
-             "tournament's exact feed name; override only if a lookup fails.")
+        # The numeric id, not a derived slug. A slug that does not match returns
+        # an empty sheet rather than an error, so a bad guess showed up as a
+        # bracket built from the fixtures fallback -- right pairings, wrong
+        # positions -- with nothing on screen to say the real draw had been
+        # missed.
+        draw_key = st.text_input(
+            "Draw-sheet key", str(row["tournament_id"]),
+            help="The tournament id the draw endpoint keys on. It also accepts a "
+                 "tournament's exact feed name; override only if a lookup fails.")
 
-    if st.button("Fetch draw & simulate", type="primary"):
+    # Runs by itself the first time an event is shown (the page opens on the
+    # featured one, and picking another runs that), then only on demand so a
+    # settings change does not re-spend a simulation or a feed call.
+    run_key = (current_tour(), tid)
+    auto_run = st.session_state.get("live_ran") != run_key
+    clicked = st.button("Re-fetch draw & simulate", help="Run again after "
+                        "changing the settings above, or to pick up new results.")
+    if clicked or auto_run:
+        st.session_state["live_ran"] = run_key
+        # Never leave the previous event's bracket on screen if this run bails.
+        st.session_state.pop("live_payload", None)
         year = int(str(row["first_date"])[:4]) if row["first_date"] else None
         live_resolved = None
         done_rounds = 0
@@ -1914,39 +1982,6 @@ def page_ratings() -> None:
         width="stretch")
 
 
-def page_status() -> None:
-    st.header("Data & pipeline status")
-    con = connect()
-    counts = {}
-    for t in ["matches", "players", "tournaments", "rankings",
-              "elo_state", "sim_results", "backtest"]:
-        try:
-            counts[t] = con.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
-        except Exception:
-            counts[t] = 0
-    rng = con.execute("SELECT MIN(tourney_date), MAX(tourney_date) FROM matches").fetchone()
-    # The hosted bundle leaves the 25 MB odds table out and ships its two
-    # counts in serve_meta.json; on a laptop the table itself is there.
-    from tennis.ops import bundle
-    odds = (bundle.local_meta() or {}).get("odds") or bundle.odds_summary(con)
-    state = dict(con.execute("SELECT key, value FROM pipeline_state").fetchall())
-    con.close()
-
-    c = st.columns(4)
-    c[0].metric("Matches", f"{counts['matches']:,}")
-    c[1].metric("Players", f"{counts['players']:,}")
-    c[2].metric("Tournaments", f"{counts['tournaments']:,}")
-    c[3].metric("Matches with odds", f"{odds['matches']:,}",
-                help=f"{odds['rows']:,} price rows across all bookmakers")
-    st.write(f"**Coverage:** {rng[0]} → {rng[1]}")
-    st.json(state)
-
-    p = ARTIFACTS / "last_daily_run.json"
-    if p.exists():
-        st.subheader("Last daily run")
-        st.json(json.loads(p.read_text()))
-
-
 def _pair_key(df: pd.DataFrame) -> pd.Series:
     """Order-insensitive fixture key: the site's p1/p2 order is not stable."""
     pair = pd.DataFrame({"a": df.p1_name, "b": df.p2_name})
@@ -2112,6 +2147,14 @@ def _kelly(p: np.ndarray, price: np.ndarray, cap: float) -> np.ndarray:
 
 def page_betting() -> None:
     st.header("Betting")
+    upcoming, record = st.tabs(["Upcoming bets", "Track record by tournament"])
+    with upcoming:
+        _betting_upcoming()
+    with record:
+        _betting_record()
+
+
+def _betting_upcoming() -> None:
     st.caption(
         "Model probability against the live moneyline for upcoming fixtures. "
         "Expected value is shown beside **what that expected value has "
@@ -2348,18 +2391,188 @@ def _betting_reality(edge: float) -> None:
     )
 
 
+GOOD, BAD = "#2e9e5b", "#d1495b"
+BET_TYPES = [("winner", "Winner"), ("totals", "Totals*"), ("spread", "Spread*")]
+
+
+def _record_cell(t: dict) -> str:
+    """"5-3 +1.2u (+15%)" for one event's bets of one type, coloured by sign."""
+    if not t["bets"]:
+        return "\u2014"
+    lost = t["bets"] - t["won"] - t["push"]
+    rec = f"{t['won']}-{lost}" + (f"-{t['push']}" if t["push"] else "")
+    col = GOOD if t["profit"] > 0 else BAD if t["profit"] < 0 else "inherit"
+    return (f"{rec} <span style='color:{col}'>{t['profit']:+.1f}u "
+            f"({t['profit'] / t['bets'] * 100:+.0f}%)</span>")
+
+
+def _sum_bets(events: list[dict], kind: str) -> dict:
+    return {k: sum(e[kind][k] for e in events)
+            for k in ("bets", "won", "push", "profit")}
+
+
+def _betting_record() -> None:
+    """How the model's bets did at each tournament, newest first.
+
+    Winner bets are the real backtest against Pinnacle closing prices. Totals
+    and spread have no market behind them in the free data, so they are the
+    synthetic-line test and are starred everywhere they appear.
+    """
+    rep = load_report(current_tour()) or {}
+    bt_ = rep.get("by_tournament")
+    if not bt_ or not bt_.get("tournaments"):
+        st.info("No per-tournament record yet. Run "
+                "`.venv/bin/python -m tennis.models.evaluate`.")
+        return
+    priced = bt_.get("priced", False)
+    events = list(reversed(bt_["tournaments"]))      # newest first
+    edges = bt_["edges"]
+
+    st.caption(
+        f"Walk-forward backtest, main tour events since {str(bt_['since'])[:4]}, "
+        "flat 1-unit stakes. **Winner:** every match where the model's expected "
+        f"value against the closing price beat {edges['winner']:.0%}"
+        + ("." if priced else " \u2014 no prices for this tour, so only the "
+           "model's picks are shown.")
+        + f" **\\*Totals and spread are synthetic:** there is no real market for "
+        "them in the free data, so the model is bet against a naive prior-history "
+        f"line at -110 whenever it differs by more than {edges['totals']:g} games. "
+        "That shows the model has signal; it is not a profitability estimate."
+    )
+
+    c1, c2 = st.columns([1, 2])
+    window = c1.selectbox("Show", ["Last 8 events", "Last 20 events",
+                                   "Last 50 events", "Everything"], key="rec_window")
+    tiers = [t for t in LEVEL_ORDER if any(e["level"] == t for e in events)]
+    picked = c2.multiselect("Tier", tiers, default=tiers,
+                            format_func=lambda t: LEVEL_LABEL.get(t, t),
+                            key="rec_tiers")
+    shown = [e for e in events if e["level"] in picked]
+    n = {"Last 8 events": 8, "Last 20 events": 20, "Last 50 events": 50}.get(window)
+    shown = shown[:n] if n else shown
+    if not shown:
+        st.info("No events match.")
+        return
+
+    # Totals for exactly what is on screen.
+    pk = (sum(e["picks"]["correct"] for e in shown), sum(e["picks"]["n"] for e in shown))
+    cols = st.columns(4)
+    cols[0].metric("Winner picks correct", f"{pk[0] / pk[1] * 100:.1f}%",
+                   help=f"{pk[0]:,} of {pk[1]:,} matches: the model's favourite "
+                        "won. Every match counts, bet or not.")
+    for col, (kind, label) in zip(cols[1:], BET_TYPES):
+        t = _sum_bets(shown, kind)
+        if not t["bets"]:
+            col.metric(f"{label} bets", "\u2014")
+            continue
+        lost = t["bets"] - t["won"] - t["push"]
+        col.metric(f"{label} bets", f"{t['won']}-{lost}"
+                   + (f"-{t['push']}" if t["push"] else ""),
+                   delta=f"{t['profit']:+.1f}u  ROI {t['profit'] / t['bets'] * 100:+.1f}%")
+
+    rows = []
+    for e in shown:
+        d = str(e["date"])
+        row = {
+            "Event": e["name"],
+            "Week of": f"{d[:4]}-{d[4:6]}-{d[6:]}" if e["date"] else "",
+            "Tier": LEVEL_LABEL.get(e["level"], "\u2014"),
+            "Surface": e["surface"] or "\u2014",
+            "Picks": (f"{e['picks']['correct']}/{e['picks']['n']} "
+                      f"({e['picks']['correct'] / e['picks']['n'] * 100:.0f}%)"),
+        }
+        for kind, label in BET_TYPES:
+            if kind != "winner":
+                row[label] = _record_cell(e[kind])
+            elif not e.get("price_src"):
+                row[label] = "no prices"
+            else:
+                row[label] = _record_cell(e[kind]) + (
+                    " \u2020" if "TE" in e["price_src"] and e[kind]["bets"] else "")
+        rows.append(row)
+    show_table(pd.DataFrame(rows))
+    st.caption("Each cell is wins-losses (-pushes), then profit in units and ROI. "
+               "A single event is a handful of bets, so its ROI is mostly noise "
+               "\u2014 read the totals above, not any one row.")
+    ps_end = bt_.get("ps_last_seen")
+    if any("TE" in (e.get("price_src") or "") for e in shown):
+        st.caption(
+            "\u2020 Priced from our own last pre-match capture (TennisExplorer), "
+            "not Pinnacle: "
+            + (f"Pinnacle's historical prices end {str(ps_end)[:4]}-"
+               f"{str(ps_end)[4:6]}-{str(ps_end)[6:]}. " if ps_end else "")
+            + "That book's margin is about 5.5% against Pinnacle's 2.7%, so "
+            "these ROIs are not comparable with the Pinnacle-priced rows "
+            "\u2014 they are what the same bets would have returned at a "
+            "retail-style price. \"No prices\" means no price was captured for "
+            "that event.")
+
+    # Running profit across what is shown, oldest to newest.
+    chron = list(reversed(shown))
+    fig = go.Figure()
+    for kind, label in BET_TYPES:
+        if kind == "winner" and not priced:
+            continue
+        fig.add_trace(go.Scatter(
+            x=[e["name"] + " " + str(e["date"])[2:4] for e in chron],
+            y=np.cumsum([e[kind]["profit"] for e in chron]),
+            mode="lines+markers", name=label))
+    fig.update_layout(height=320, margin=dict(t=30, b=10),
+                      yaxis_title="Cumulative profit (units)", xaxis_title=None,
+                      title="Running profit across the events above")
+    st.plotly_chart(fig, width="stretch")
+
+    st.subheader("Bet by bet")
+    labels = {f"{e['name']} \u2014 {LEVEL_LABEL.get(e['level'], '')} \u2014 "
+              f"{str(e['date'])[:4]}-{str(e['date'])[4:6]}-{str(e['date'])[6:]}": e
+              for e in events}
+    pick = st.selectbox("Tournament", list(labels), key="rec_event")
+    ev = labels[pick]
+    if not ev["bets"]:
+        st.info("Match-level detail is kept for the 60 most recent events only; "
+                "older ones show the summary row above.")
+        return
+    kinds = [k for k, _ in BET_TYPES if k != "winner" or priced]
+    # Open on the first bet type this event actually has bets for.
+    first = next((i for i, k in enumerate(kinds)
+                  if any(b["t"] == k for b in ev["bets"])), 0)
+    kind_sel = st.radio("Bet type", kinds, index=first, horizontal=True,
+                        format_func=dict(BET_TYPES).get, key=f"rec_kind_{ev['key']}")
+    bets = [b for b in ev["bets"] if b["t"] == kind_sel]
+    if not bets:
+        st.info("The model took no bets of this type here.")
+        return
+    df = pd.DataFrame(bets)
+    names = {"winner": ("Pick", "Against", "Price", "Model prob"),
+             "totals": ("Side", "Match", "Line", "Model"),
+             "spread": ("Covers", "Against", "Handicap", "Model margin")}[kind_sel]
+    df = df.rename(columns={"r": "Round", "pick": names[0], "vs": names[1],
+                            "line": names[2], "model": names[3],
+                            "actual": "Actual"})
+    df["Result"] = np.where(df["push"] == 1, "push",
+                            np.where(df["won"] == 1, "won", "lost"))
+    df["Profit (u)"] = df["profit"].map(lambda v: f"{v:+.2f}")
+    keep = ["Round", names[0], names[1], names[2], names[3]]
+    if kind_sel != "winner":
+        keep.append("Actual")
+    show_table(df[keep + ["Result", "Profit (u)"]])
+
+
+
+# The first entry is the landing page.
 PAGES = {
-    "Match predictions": page_predictions,
     "Tournament simulation": page_simulation,
     "Betting": page_betting,
+    "Match predictions": page_predictions,
     "Backtest performance": page_backtest,
-    "Calibration": page_calibration,
     "Elo ratings": page_ratings,
-    "Status": page_status,
 }
 
 st.sidebar.title("🎾 Tennis model")
 st.sidebar.caption(data_as_of())
+_stale = pipeline_stale_warning()
+if _stale:
+    st.sidebar.warning(_stale)
 st.sidebar.radio("Tour", list(TOURS), key="tour_label", horizontal=True)
 choice = st.sidebar.radio("Page", list(PAGES))
 if current_tour() == "atp":

@@ -1782,3 +1782,23 @@ def test_tournament_draw_is_keyed_on_the_id_not_a_derived_slug():
     assert "tournament_draw(draw_key" in app
     assert "tournament_slug(str(row" not in app, \
         "the draw key should no longer be derived from the tournament name"
+
+
+def test_per_tournament_bets_are_the_headline_bets():
+    """The per-tournament view must count exactly the bets roi_winner counts."""
+    from tennis.models.evaluate import roi_winner, winner_bets
+
+    rng = np.random.default_rng(0)
+    n = 400
+    df = pd.DataFrame({
+        "match_id": [f"2024-1|x|0|0-R32-{i}-{i + 1}" for i in range(n)],
+        "p_win": rng.uniform(0.2, 0.8, n),
+        "y_win": rng.integers(0, 2, n),
+        "p1_price": rng.uniform(1.4, 3.0, n),
+        "p2_price": rng.uniform(1.4, 3.0, n),
+    })
+    d, _ = winner_bets(df, 0.03)
+    r = roi_winner(df, edge=0.03)
+    profit = np.where(d["won"], d["price"] - 1, -1.0).sum()
+    assert r["bets"] == len(d)
+    assert abs(r["profit"] - round(float(profit), 2)) < 1e-9
